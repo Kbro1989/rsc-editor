@@ -607,7 +607,7 @@ export function createMockApi(): EditorApi {
     async submitOps(ops: Op[]): Promise<OpSubmitResult> {
       const unheld = ops
         .filter((op) => {
-          if (op.type !== 'sector') return false;
+          if (op.type === 'definition' || op.type === 'asset') return false;
           const lock = locks.get(sectorKey(op.sector));
           return !lock || lock.userId !== YOU.userId;
         })
@@ -756,7 +756,14 @@ export function createMockApi(): EditorApi {
 
     useProject(): void {
       // One project only; switching is meaningless in the mock.
-    }
+    },
+
+    libraryPath(): string | null {
+      // The asset library needs the live backend's archives.
+      return null;
+    },
+
+    invalidateLibraryAssets(): void {}
   };
 
   return api;

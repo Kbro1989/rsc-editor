@@ -71,6 +71,7 @@ import {
 import { PlaneSectorCache, planeSectorCoords } from './plane-sectors.js';
 import {
   buildBrushOutline,
+  buildEntityMarkers,
   buildRectOutline,
   buildSectorBorder,
   buildTileGrid,
@@ -78,17 +79,21 @@ import {
   sectorTintTransform
 } from './overlay-geometry.js';
 import { createMesher } from './mesher.js';
-import { sameTile, tileOfFace, tileOfGroundPlane, worldTileAt } from './picking.js';
+import { sameTile, tilesBetween, tileOfFace, tileOfGroundPlane, worldTileAt } from './picking.js';
 import {
   SectorGeometryCache,
   SECTOR_SPAN,
+  setShading,
   WorldHeights,
   type SceneryDraw,
   type SectorGeometrySet,
   type SectorSource
 } from './sector-geometry.js';
 import { loadSceneryModels, type ResolvedModels } from './scenery-models.js';
+import { refreshLibraryAssets } from './library-refresh.js';
+import { EntitySprites } from './EntitySprites.js';
 import type { ViewportProps } from './viewport-props.js';
+import { inTextField } from '../hooks/useKeyboard.js';
 
 // The vertex colours are final sRGB values, not linear working-space colours.
 // See the header.
@@ -147,6 +152,15 @@ const MESH_BUDGET = 1;
  */
 const GHOST_OPACITY = 0.72;
 
+/** Server-side placement markers: NPC pins, item squares, door frames. */
+const ENTITY_COLOURS = { npc: '#ffd84a', item: '#4de1ff', door: '#ff8a3d' } as const;
+
+/** How far the pointer must travel after a press before painting follows it. */
+const PAINT_DRAG_THRESHOLD_PX = 5;
+
+/** Wireframe colour for walls the client skips; magenta reads against grass, stone and water. */
+const HIDDEN_WALL_COLOUR = '#ff3df2';
+
 /** Colours for the connector overlay. Amber links, green markers. */
 const LINK_COLOUR = '#ffb020';
 const MARKER_COLOUR = '#5cf08a';
@@ -181,6 +195,10 @@ interface SceneProps extends ViewportProps {
   /** planes being drawn, bottom to top */
   planeSet: number[];
   showConnectors: boolean;
+  showHiddenWalls: boolean;
+  showEntitySprites: boolean;
+  /** false: the editor's plain colours instead of the client's shading */
+  shading: boolean;
 }
 
 interface Plate {
@@ -296,7 +314,14 @@ function SceneContents(props: SceneProps) {
       // to be looked through, not clicked through: if it could take a hit, a
       // brush stroke on the ground floor would silently start landing on the
       // first floor wherever one happens to be overhead.
-      const hits = raycaster.intersectObjects([...terrainMeshes.current.values()], false);
+      const meshes = [...terrainMeshes.current.values()];
+      // A sector re-meshed by an edit mounts a new mesh whose world matrix is
+      // still identity until the next frame renders, so a pick in between
+      // missed it and fell through to the flat ground plane -- a tile far from
+      // the cursor on a hill. Painting re-meshes on every tile, so a held
+      // stroke jumped around and left gaps.
+      for (const mesh of meshes) mesh.updateWorldMatrix(true, false);
+      const hits = raycaster.intersectObjects(meshes, false);
       const hit = hits[0];
 
       if (hit) {
@@ -400,6 +425,8 @@ function SceneContents(props: SceneProps) {
             atlas={atlas}
             ghost={ghost}
             showDeck={!above}
+            showHiddenWalls={props.showHiddenWalls && !ghost}
+            shading={props.shading}
             planeY={planeY(set.coord.plane)}
             wallY={set.absoluteWalls ? absoluteWallY(set.coord.plane) : planeY(set.coord.plane)}
             register={
@@ -659,8 +686,14 @@ function SectorLayer({
   showDeck,
   planeY,
   wallY,
-  register
+  register,
+  showHiddenWalls,
+  shading
 }: {
+  /** see `setShading` */
+  shading: boolean;
+  /** overlay the walls the client skips as a wireframe */
+  showHiddenWalls: boolean;
   set: SectorGeometrySet;
   atlas: Texture | null;
   /** true for a plane that is being shown but not edited; see GHOST_OPACITY */
@@ -694,6 +727,13 @@ function SectorLayer({
   /** omitted for a ghost plane, which is not pickable */
   register?: (mesh: Mesh | null) => void;
 }) {
+  // Before paint, so a toggle never shows a frame of the other colours.
+  useLayoutEffect(() => {
+    for (const geometry of [set.terrain, set.walls, set.roofs]) {
+      if (geometry) setShading(geometry, shading);
+    }
+  }, [set, shading]);
+
   // The ACTIVE plane: `alphaTest` WITHOUT `transparent`. A cutout is a hole, not
   // a translucent surface: leaving the material opaque keeps it in the
   // depth-sorted opaque queue and discards the cut texels in the shader, which
@@ -740,6 +780,12 @@ function SectorLayer({
       <group position={[0, wallY, 0]}>
         {set.walls && <mesh geometry={set.walls}>{material}</mesh>}
         {set.roofs && <mesh geometry={set.roofs}>{material}</mesh>}
+        {showHiddenWalls && set.hiddenWalls && (
+          // Not pickable and never hides anything: it is a marker, not a surface.
+          <mesh geometry={set.hiddenWalls} raycast={() => null} renderOrder={1}>
+            <meshBasicMaterial color={HIDDEN_WALL_COLOUR} wireframe toneMapped={false} side={DoubleSide} />
+          </mesh>
+        )}
       </group>
     </group>
   );
@@ -763,8 +809,19 @@ function Overlays(props: SceneProps) {
     showSectorBorders,
     showLockTint,
     painting,
-    version
+    version,
+    entities,
+    config,
+    showEntitySprites
   } = props;
+  const libraryVersion = props.libraryVersion ?? 0;
+  // Entities drawn as pictures; the rest keep their line markers.
+  const [pictured, setPictured] = useState<ReadonlySet<string>>(() => new Set());
+  const onPictured = useCallback((ids: ReadonlySet<string>) => setPictured(ids), []);
+  const onPlaneEntities = useMemo(
+    () => (entities ?? []).filter((e) => e.plane === plane),
+    [entities, plane]
+  );
 
   // One height reader per render. It memoises a LandscapeView per sector, so
   // every overlay below shares the same eight-neighbour lookups.
@@ -803,12 +860,48 @@ function Overlays(props: SceneProps) {
     );
   }, [selection, plane, heights]);
 
+  const ghost = props.ghost ?? null;
   const brushGeometry = useMemo(() => {
     if (!hoverTile || hoverTile.plane !== plane) return null;
+    if (ghost) {
+      // The Group tool's drop preview: where the group will land.
+      const r = ghost(hoverTile);
+      return lineGeometry(buildRectOutline(heights, r.x0, r.y0, r.x1, r.y1));
+    }
     return lineGeometry(
       buildBrushOutline(heights, hoverTile.wx, hoverTile.wy, brushRadius, brushShape)
     );
-  }, [hoverTile, plane, brushRadius, brushShape, heights]);
+  }, [hoverTile, plane, brushRadius, brushShape, heights, ghost]);
+
+  // Server-side placements: one line buffer per kind, plus the selection on
+  // top of them. Only the plane being edited, like the other overlays.
+  const entityGeometries = useMemo(() => {
+    const onPlane = onPlaneEntities;
+    const drawnAsPicture = (id: string) => showEntitySprites && pictured.has(id);
+    const byKind = (kind: 'npc' | 'item' | 'door') =>
+      lineGeometry(
+        buildEntityMarkers(
+          heights,
+          onPlane.filter((e) => e.kind === kind && !e.selected && !drawnAsPicture(e.id))
+        )
+      );
+    const selected = onPlane.filter((e) => e.selected);
+    const wander = selected.find((e) => e.wander)?.wander;
+    return {
+      npc: byKind('npc'),
+      item: byKind('item'),
+      door: byKind('door'),
+      selected: lineGeometry(buildEntityMarkers(heights, selected)),
+      wander: wander
+        ? lineGeometry(buildRectOutline(heights, wander.x0, wander.y0, wander.x1, wander.y1))
+        : null
+    };
+  }, [onPlaneEntities, heights, pictured, showEntitySprites]);
+  useEffect(() => {
+    return () => {
+      for (const g of Object.values(entityGeometries)) g?.dispose();
+    };
+  }, [entityGeometries]);
 
   useDisposeOnChange(gridGeometry);
   useDisposeOnChange(selectionGeometry);
@@ -874,10 +967,33 @@ function Overlays(props: SceneProps) {
         </lineSegments>
       )}
 
+      {showEntitySprites && (
+        <EntitySprites
+          entities={onPlaneEntities}
+          config={config}
+          heights={heights}
+          libraryVersion={libraryVersion}
+          onPictured={onPictured}
+        />
+      )}
+      {(['npc', 'item', 'door'] as const).map((kind) => (
+        <lineSegments key={`entities-${kind}`} geometry={entityGeometries[kind]}>
+          <lineBasicMaterial color={ENTITY_COLOURS[kind]} toneMapped={false} />
+        </lineSegments>
+      ))}
+      <lineSegments geometry={entityGeometries.selected}>
+        <lineBasicMaterial color="#ffffff" toneMapped={false} depthTest={false} />
+      </lineSegments>
+      {entityGeometries.wander && (
+        <lineSegments geometry={entityGeometries.wander}>
+          <lineBasicMaterial color={ENTITY_COLOURS.npc} toneMapped={false} />
+        </lineSegments>
+      )}
+
       {brushGeometry && (
         <lineSegments geometry={brushGeometry}>
           <lineBasicMaterial
-            color="#ffffff"
+            color={ghost ? '#ffb020' : '#ffffff'}
             transparent
             opacity={painting ? 1 : 0.55}
             toneMapped={false}
@@ -986,6 +1102,13 @@ export function Viewport3D(props: ViewportProps) {
   const dragRef = useRef<{
     mode: 'paint' | 'pan' | 'region' | 'orbit';
     from: WorldTile | null;
+    /** paint: the tile the last edit went to, so a drag edits each tile once */
+    last?: WorldTile | null;
+    /** paint: where the button went down, in screen pixels */
+    downX?: number;
+    downY?: number;
+    /** paint: the pointer has travelled far enough to count as a drag */
+    moved?: boolean;
   } | null>(null);
   const lastHover = useRef<WorldTile | null>(null);
 
@@ -1012,6 +1135,13 @@ export function Viewport3D(props: ViewportProps) {
    */
   const [planeMode, setPlaneMode] = useState<PlaneSetMode>('all');
   const [showConnectors, setShowConnectors] = useState(true);
+  const [showHiddenWalls, setShowHiddenWalls] = useState(true);
+  const [showEntitySprites, setShowEntitySprites] = useState(true);
+  /**
+   * The client's shading wraps to black on steep terrain -- faithful, and
+   * useless to paint on. Off swaps in `plainColours`; see `setShading`.
+   */
+  const [shading, setShadingOn] = useState(true);
   const [hud, setHud] = useState({
     triangles: 0,
     sectors: 0,
@@ -1081,22 +1211,31 @@ export function Viewport3D(props: ViewportProps) {
    * deliberately does not memoise a too-early miss, so this second call is the
    * one that gets the real sheet. Resolving to the same result is a no-op.
    */
+  const libraryVersion = props.libraryVersion ?? 0;
+  const seenLibrary = useRef(libraryVersion);
   useEffect(() => {
     let alive = true;
+    // A library change replaces the atlas outright; otherwise a server sheet,
+    // once had, is not swapped for a later (possibly bundled) answer.
+    const replace = seenLibrary.current !== libraryVersion;
+    if (replace) {
+      seenLibrary.current = libraryVersion;
+      refreshLibraryAssets();
+    }
     loadAtlas().then(
       (resolved) => {
         if (!alive) return;
-        setAtlas((current) => (current?.source === 'server' ? current : resolved));
+        setAtlas((current) => (!replace && current?.source === 'server' ? current : resolved));
       },
       (err: unknown) => alive && setAtlasError(err instanceof Error ? err.message : String(err))
     );
     return () => {
       alive = false;
     };
-  }, [config]);
+  }, [config, libraryVersion]);
 
   /**
-   * The `.ob3` models, once per session.
+   * The `.ob3` models, once per session (and again after a library change).
    *
    * Keyed on `config` for the same reason the atlas is: the scene mounts before
    * a project is open, and the asset lives under the project. A miss is a normal
@@ -1106,14 +1245,15 @@ export function Viewport3D(props: ViewportProps) {
    */
   useEffect(() => {
     let alive = true;
+    const replace = libraryVersion > 0;
     loadSceneryModels().then(
-      (resolved) => alive && setModels((current) => current ?? resolved),
+      (resolved) => alive && setModels((current) => (replace ? resolved : (current ?? resolved))),
       () => alive && setModels(null)
     );
     return () => {
       alive = false;
     };
-  }, [config]);
+  }, [config, libraryVersion]);
 
   /* sectors -> mesh queue */
   const activeSectors = useMemo(() => {
@@ -1190,6 +1330,12 @@ export function Viewport3D(props: ViewportProps) {
     }
     const down = (e: KeyboardEvent) => {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
+      // WASD is also how you type; a search box or a definition form gets the
+      // keys, and the camera stays put.
+      if (inTextField(e.target)) {
+        flyRef.current.clear();
+        return;
+      }
       const key = e.key.toLowerCase();
       if (FLY_KEYS.has(key)) {
         flyRef.current.add(key);
@@ -1201,11 +1347,18 @@ export function Viewport3D(props: ViewportProps) {
       flyRef.current.delete(e.key.toLowerCase());
       if (!e.shiftKey) flyRef.current.delete('shift');
     };
+    // Held keys with no keyup to match: clicking into a field, or leaving the
+    // window, would otherwise leave the camera drifting forever.
+    const stop = () => flyRef.current.clear();
     window.addEventListener('keydown', down);
     window.addEventListener('keyup', up);
+    window.addEventListener('blur', stop);
+    document.addEventListener('focusin', stop);
     return () => {
       window.removeEventListener('keydown', down);
       window.removeEventListener('keyup', up);
+      window.removeEventListener('blur', stop);
+      document.removeEventListener('focusin', stop);
       flyRef.current.clear();
     };
   }, [mode]);
@@ -1279,7 +1432,7 @@ export function Viewport3D(props: ViewportProps) {
       onDragRegion({ plane, x0: tile.wx, y0: tile.wy, x1: tile.wx, y1: tile.wy });
       return;
     }
-    dragRef.current = { mode: 'paint', from: tile };
+    dragRef.current = { mode: 'paint', from: tile, last: tile, downX: e.clientX, downY: e.clientY, moved: false };
     onPick(tile, { alt: e.altKey, shift: e.shiftKey, continued: false });
   };
 
@@ -1311,7 +1464,21 @@ export function Viewport3D(props: ViewportProps) {
     if (drag.mode === 'region' && drag.from) {
       onDragRegion({ plane, x0: drag.from.wx, y0: drag.from.wy, x1: tile.wx, y1: tile.wy });
     } else if (drag.mode === 'paint') {
-      onPick(tile, { alt: e.altKey, shift: e.shiftKey, continued: true });
+      // A click is not a drag. A hand never holds perfectly still, and raising
+      // the terrain moves the surface under a stationary cursor, so without
+      // this one click re-applied the tool several times and spilled onto the
+      // tiles next to it.
+      if (!drag.moved) {
+        const dx = e.clientX - (drag.downX ?? e.clientX);
+        const dy = e.clientY - (drag.downY ?? e.clientY);
+        if (dx * dx + dy * dy < PAINT_DRAG_THRESHOLD_PX * PAINT_DRAG_THRESHOLD_PX) return;
+        drag.moved = true;
+      }
+      // Each tile once per crossing: moving within a tile is not another stroke.
+      if (sameTile(tile, drag.last ?? null)) return;
+      const path = drag.last ? tilesBetween(drag.last, tile) : [tile];
+      drag.last = tile;
+      for (const step of path) onPick(step, { alt: e.altKey, shift: e.shiftKey, continued: true });
     }
   };
 
@@ -1390,6 +1557,9 @@ export function Viewport3D(props: ViewportProps) {
         onPointerUp={() => {
           dragRef.current = null;
         }}
+        onPointerCancel={() => {
+          dragRef.current = null;
+        }}
         onPointerLeave={() => {
           dragRef.current = null;
           lastHover.current = null;
@@ -1428,6 +1598,9 @@ export function Viewport3D(props: ViewportProps) {
             sectorList={activeSectors}
             planeSet={planeSet}
             showConnectors={showConnectors}
+            showHiddenWalls={showHiddenWalls}
+            showEntitySprites={showEntitySprites}
+            shading={shading}
             cache={cache}
             atlas={atlas?.texture ?? null}
             orbitRef={orbitRef}
@@ -1587,6 +1760,27 @@ export function Viewport3D(props: ViewportProps) {
               title="Mark ladders and staircases, and draw the link between the floors they join"
             >
               ladders
+            </CameraButton>
+            <CameraButton
+              active={showHiddenWalls}
+              onClick={() => setShowHiddenWalls((v) => !v)}
+              title="Outline walls the game does not draw from the map (doors, doorframes and other placeholders)"
+            >
+              hidden walls
+            </CameraButton>
+            <CameraButton
+              active={showEntitySprites}
+              onClick={() => setShowEntitySprites((v) => !v)}
+              title="Draw NPCs and ground items as their sprites; off shows markers"
+            >
+              sprites
+            </CameraButton>
+            <CameraButton
+              active={shading}
+              onClick={() => setShadingOn((v) => !v)}
+              title="The client's own shading. Off: plain colours with a hint of slope, for painting on steep ground where the client's shade turns black"
+            >
+              shading
             </CameraButton>
           </div>
         </div>

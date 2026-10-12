@@ -89,6 +89,16 @@ async function setUp(
   expect(
     (await alice.api.put(`/api/projects/${projectId}/definitions/objects/0`, { data: { data: object } })).ok()
   ).toBe(true);
+  // The Holes tool paints a tile definition of type "hole"; the shipped cache
+  // has its first at overlay 8, so define tiles up to there.
+  for (let i = 0; i < 8; i++) {
+    const tile = i === 7
+      ? { colour: 'transparent', texture: null, type: 'hole', blocked: true }
+      : { colour: 'rgb(128, 128, 128)', texture: null, type: 'ground', blocked: false };
+    expect(
+      (await alice.api.put(`/api/projects/${projectId}/definitions/tiles/${i}`, { data: { data: tile } })).ok()
+    ).toBe(true);
+  }
   expect(
     (await alice.api.put(`/api/projects/${projectId}/members/${bob.id}`, { data: { role: 'editor' } })).ok()
   ).toBe(true);
@@ -102,7 +112,8 @@ test('every editing tool writes an op that a peer receives', async ({ browser, b
   await a.getByRole('button', { name: 'Claim', exact: true }).click();
   await expect(status(a).getByText('you hold this sector')).toBeVisible();
 
-  for (const tool of ['Elevation', 'Paint', 'Walls', 'Roof', 'Scenery', 'Region']) {
+  // Eraser last: it has the other tools' walls, overlay, scenery, NPC and item to clear.
+  for (const tool of ['Elevation', 'Paint', 'Walls', 'Roof', 'Scenery', 'Region', 'NPCs', 'Items', 'Group', 'Holes', 'Eraser']) {
     await test.step(tool, async () => {
       const head = await seq(a);
       await a.getByRole('button', { name: new RegExp(`${tool}$`) }).first().click();
@@ -115,11 +126,125 @@ test('every editing tool writes an op that a peer receives', async ({ browser, b
         const box = (await a.locator('.pane--center canvas').first().boundingBox())!;
         await a.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
       }
+      if (tool === 'Group') {
+        // The drag selected what the tools above left there; copy drops it
+        // beside the original.
+        await a.getByRole('group', { name: 'Mode' }).getByRole('button', { name: 'copy' }).click();
+        const box = (await a.locator('.pane--center canvas').first().boundingBox())!;
+        await a.mouse.click(box.x + box.width / 2 + 120, box.y + box.height / 2 + 60);
+      }
       await expect.poll(() => seq(a), { message: `${tool} wrote nothing` }).toBeGreaterThan(head);
       const after = await settledSeq(a);
       await expect.poll(() => seq(b)).toBe(after);
     });
   }
+});
+
+test('a shaky click edits once, and a drag edits each tile once', async ({ browser, baseURL }) => {
+  const { alice } = await setUp(baseURL!);
+  const a = await openEditor(browser, alice);
+  await a.getByRole('button', { name: 'Claim', exact: true }).click();
+  await expect(status(a).getByText('you hold this sector')).toBeVisible();
+  await a.getByRole('button', { name: /Elevation$/ }).first().click();
+
+  const box = (await a.locator('.pane--center canvas').first().boundingBox())!;
+  const x = box.x + box.width / 2;
+  const y = box.y + box.height / 2;
+
+  // A click whose hand wobbles by a couple of pixels: one op, not one per wobble.
+  const head = await settledSeq(a);
+  await a.mouse.move(x, y);
+  await a.mouse.down();
+  for (const [dx, dy] of [[1, 0], [2, 1], [0, 2], [-1, 1], [2, -1], [0, 0]]) {
+    await a.mouse.move(x + dx!, y + dy!);
+  }
+  await a.mouse.up();
+  await expect.poll(() => seq(a)).toBeGreaterThan(head);
+  expect(await settledSeq(a)).toBe(head + 1);
+});
+
+test('an NPC one editor places, the other can select and edit', async ({ browser, baseURL }) => {
+  const { alice, bob } = await setUp(baseURL!);
+  const a = await openEditor(browser, alice);
+  const b = await openEditor(browser, bob);
+  await a.getByRole('button', { name: 'Claim', exact: true }).click();
+  await expect(status(a).getByText('you hold this sector')).toBeVisible();
+
+  const click = async (page: Page) => {
+    const box = (await page.locator('.pane--center canvas').first().boundingBox())!;
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  };
+
+  await a.getByRole('button', { name: /NPCs$/ }).first().click();
+  const head = await settledSeq(a);
+  await click(a);
+  await expect.poll(() => seq(b)).toBe(head + 1);
+
+  // Bob, read-only, can still select it and see what it is...
+  await b.getByRole('button', { name: /Select$/ }).first().click();
+  await click(b);
+  await expect(b.getByText('Selected npc')).toBeVisible();
+
+  // ...and Alice can edit it; Bob's inspector follows.
+  await click(a); // clicking an existing spawn selects it
+  await expect(a.getByText('Selected npc')).toBeVisible();
+  await a.getByRole('spinbutton', { name: 'Wander max x' }).fill('999');
+  await a.getByRole('spinbutton', { name: 'Wander max x' }).press('Tab');
+  await expect(b.getByRole('spinbutton', { name: 'Wander max x' })).toHaveValue('999');
+
+  await a.getByRole('button', { name: 'Delete', exact: true }).click();
+  await expect(b.getByText('Selected npc')).toHaveCount(0);
+});
+
+test('the asset library: an upload one editor makes appears for the other', async ({ browser, baseURL }) => {
+  const { alice, bob } = await setUp(baseURL!);
+  const a = await openEditor(browser, alice);
+  const b = await openEditor(browser, bob);
+
+  const openAssets = async (page: Page, tab: string) => {
+    await page.getByRole('button', { name: 'Assets', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: 'Assets' });
+    await dialog.getByRole('tab', { name: tab }).click();
+    return dialog;
+  };
+  const da = await openAssets(a, 'Item sprites');
+  // The tab bar must actually take up room, not just exist.
+  const tabs = await da.getByRole('tablist', { name: 'Asset kind' }).boundingBox();
+  expect(tabs?.height ?? 0).toBeGreaterThan(15);
+  const db = await openAssets(b, 'Item sprites');
+  await expect(da.getByText('Nothing matches.')).toBeVisible();
+
+  // A 48x32 PNG, solid colour, made in the page.
+  const png = await a.evaluate(async () => {
+    const canvas = new OffscreenCanvas(48, 32);
+    const g = canvas.getContext('2d')!;
+    g.fillStyle = '#c03020';
+    g.fillRect(4, 4, 40, 24);
+    const blob = await canvas.convertToBlob({ type: 'image/png' });
+    return Array.from(new Uint8Array(await blob.arrayBuffer()));
+  });
+  await da.getByLabel('Add sprite 0…').setInputFiles({ name: 'red.png', mimeType: 'image/png', buffer: Buffer.from(png) });
+  await expect(da.getByText('Added sprite 0.')).toBeVisible();
+  await expect(da.getByText('#0', { exact: true })).toBeVisible();
+  // Bob's open screen follows without a reload.
+  await expect(db.getByText('#0', { exact: true })).toBeVisible();
+
+  // A model from OBJ, on the other tab.
+  await da.getByRole('tab', { name: 'Models' }).click();
+  await da.getByLabel('New model name').fill('e2ebox');
+  await da.getByLabel('Add model…').setInputFiles([
+    { name: 'box.obj', mimeType: 'text/plain', buffer: Buffer.from('v 0 0 0\nv 1 0 0\nv 1 1 0\nusemtl red\nf 1 2 3\n') },
+    { name: 'box.mtl', mimeType: 'text/plain', buffer: Buffer.from('newmtl red\nKd 1 0 0\n') }
+  ]);
+  await expect(da.getByText('Added e2ebox.')).toBeVisible();
+  await expect(da.getByText('1 faces · 3 verts')).toBeVisible();
+
+  // Deleting an unused sprite works from the card.
+  await da.getByRole('tab', { name: 'Item sprites' }).click();
+  a.once('dialog', (dialog) => void dialog.accept());
+  await da.getByRole('button', { name: 'Delete' }).first().click();
+  await expect(da.getByText('Deleted sprite 0.')).toBeVisible();
+  await expect(db.getByText('Nothing matches.')).toBeVisible();
 });
 
 test('two editors share a sector through locks, live ops and undo', async ({ browser, baseURL }) => {

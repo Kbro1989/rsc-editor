@@ -12,6 +12,8 @@
  * covers the one shape that is purely deployment-local.
  */
 
+import { parseLogUnits, type JournalUnit } from './worlds/journal.js';
+
 export type NodeEnv = 'development' | 'production' | 'test';
 
 export interface DiscordConfig {
@@ -33,6 +35,19 @@ export interface DiscordConfig {
   adminUsernames: string[];
 }
 
+/**
+ * Where Publish hands a cache to the game server, when this install runs one
+ * (`deploy/game`). The editor only ever writes into `dir/inbox`; a systemd
+ * path unit running as root does the installing and restarting, and reports
+ * back through `dir/status.json`. See deploy/README.md, "The game server".
+ */
+export interface PublishConfig {
+  /** absolute; normally /var/lib/rsc-game */
+  dir: string;
+  /** where players open the game, shown next to the button */
+  gameUrl: string | null;
+}
+
 export interface ServerConfig {
   nodeEnv: NodeEnv;
   host: string;
@@ -49,6 +64,40 @@ export interface ServerConfig {
   /** origin of the SPA; where login redirects back to, and the CORS origin. */
   webOrigin: string;
   discord: DiscordConfig;
+  /** null: no game server here, and no Publish button */
+  publish: PublishConfig | null;
+  /**
+   * The game worlds' control sockets, a JSON file (`WORLDS_FILE`, written by
+   * deploy/game/install.sh). null: no Worlds screen.
+   */
+  worldsFile: string | null;
+  /**
+   * systemd units whose journal the Worlds screen may read
+   * (`GAME_LOG_UNITS`). A fixed list: a request picks one of these and never
+   * names a unit of its own (worlds/journal.ts).
+   */
+  logUnits: JournalUnit[];
+  /**
+   * Days to keep each kind of game event, from GAME_EVENT_RETENTION
+   * ("chat=90,pm=90,drop=30,pickup=30,*=365"). `*` is every other kind; 0
+   * keeps none. Personal data (chat, PMs) should not outlive its use.
+   */
+  eventRetentionDays: Record<string, number>;
+}
+
+export const DEFAULT_EVENT_RETENTION = 'chat=90,pm=90,drop=30,pickup=30,*=365';
+
+export function parseRetention(value: string, problems: string[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const part of value.split(',').map((p) => p.trim()).filter(Boolean)) {
+    const match = /^([a-z*][a-z-]*|\*)=(\d{1,5})$/.exec(part);
+    if (!match) {
+      problems.push(`GAME_EVENT_RETENTION: "${part}" is not kind=days`);
+      continue;
+    }
+    out[match[1]!] = Number(match[2]);
+  }
+  return out;
 }
 
 export class ConfigError extends Error {
@@ -170,6 +219,15 @@ export function loadConfig(env: Env = process.env): ServerConfig {
     .map((name) => name.trim().replace(/^@/, '').toLowerCase())
     .filter(Boolean);
 
+  const publishDir = env.PUBLISH_DIR?.trim() || null;
+  if (publishDir && !publishDir.startsWith('/')) {
+    problems.push('PUBLISH_DIR must be an absolute path');
+  }
+  const gameUrl = env.GAME_URL?.trim() ? url(env.GAME_URL.trim(), 'GAME_URL', problems) : null;
+  const worldsFile = env.WORLDS_FILE?.trim() || null;
+  const eventRetentionDays = parseRetention(env.GAME_EVENT_RETENTION ?? DEFAULT_EVENT_RETENTION, problems);
+  if (worldsFile && !worldsFile.startsWith('/')) problems.push('WORLDS_FILE must be an absolute path');
+
   if (problems.length > 0) throw new ConfigError(problems);
 
   return {
@@ -184,7 +242,13 @@ export function loadConfig(env: Env = process.env): ServerConfig {
     cookieSecure,
     publicUrl: stripTrailingSlash(publicUrl),
     webOrigin: stripTrailingSlash(webOrigin),
-    discord: { clientId, clientSecret, scopes, requiredGuildId, adminUsernames }
+    discord: { clientId, clientSecret, scopes, requiredGuildId, adminUsernames },
+    publish: publishDir
+      ? { dir: stripTrailingSlash(publishDir), gameUrl: gameUrl ? stripTrailingSlash(gameUrl) : null }
+      : null,
+    worldsFile,
+    logUnits: parseLogUnits(env.GAME_LOG_UNITS),
+    eventRetentionDays
   };
 }
 

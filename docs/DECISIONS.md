@@ -737,3 +737,152 @@ and a 401 from that call was shown as an error page ("not signed in", Retry).
 That was every anonymous first visit: in production nobody would ever have
 seen the Discord button. Any 401 during connect is now the sign-in state.
 
+
+## 18. Wall lanes hold the definition index plus one; many walls are hidden on purpose
+
+`wallsHorizontal`, `wallsVertical` and the diagonal part of `wallsDiagonal`
+store `wallObjects` index **+ 1**, so 0 can mean "no wall": the client and
+`packages/render/src/walls.ts` both read `value - 1` (and
+`value - 12000 - 1` for "\"). Roofs (`wallsRoof`) and overlays work the same
+way and the editor already handled them. The Walls tool did not: it wrote the
+picker's zero-based index as-is, so choosing wall 4 drew wall 3, and wall 0
+could not be placed at all. `buildWallOp` now takes the index (or `null` to
+clear) and writes `index + 1`; the Inspector shows `wall N <name>`.
+
+### "Invisible" is not a bug
+
+180 of the 214 wall definitions carry `invisible` (the client's
+`wallObjectInvisible`), and `World#loadSection` skips them when it meshes the
+map -- Door and Doorframe among them. The visible door is a separate entity
+the game server spawns on that edge (rsc-server's `wall-objects.json`); the map
+only holds a placeholder. The renderer copies the client, so a door painted
+with the Walls tool is invisible in the editor exactly as it is in the game.
+The wall picker and Inspector now say "hidden in game", and the viewport's
+**hidden walls** toggle (on by default) outlines them in magenta wireframe:
+`buildWalls(..., { hiddenOnly: true })` meshes only those walls with a solid
+fill, because many of them have transparent fills and would otherwise produce
+no faces. It is drawn for the active plane only and is never pickable. The tool's default
+is wall 0 ("Wall") rather than 1 ("Doorframe"), which the off-by-one had been
+disguising as a visible wall.
+
+Walls placed before this fix are stored one lower than intended. They cannot
+be told apart from imported walls by value, so they are not migrated.
+
+## 19. NPCs, ground items and doors are entities beside the lanes
+
+RuneScape Classic's server, not its cache, places NPCs, ground items and
+doors: rsc-server reads rsc-data's `locations/npcs.json`, `items.json` and
+`wall-objects.json`. They are therefore stored beside the sector lanes, as
+`EntityData` in `packages/schema/src/entities.ts` (schema change approved by
+the project owner, CLAUDE.md rule 4), not squeezed into a lane.
+
+- **Addressed like a lane write.** An entity is a sector plus a tile index,
+  so it belongs to exactly one sector and that sector's lock covers it (rule 6).
+  An NPC's wander box is a range in game coordinates and may reach past its
+  sector; it bounds movement and writes nothing. Four shipped NPCs spawn outside
+  their own box, so the box is not required to contain the spawn.
+- **One op, both sides.** `entity.add` / `update` / `remove` carry `from` and
+  `to`; undo swaps them (and add <-> remove). The hub applies an entity op only
+  if the stored entity is exactly `from`, in the same sector, compared with
+  `sameEntityData` because Postgres `jsonb` does not keep key order.
+- **Storage.** An `entities` table holds current state (migration 0003); the op
+  log is the history, and snapshot export rewinds entities with everything else.
+  A sector's entities travel as a `sector.entities` JSON message after its
+  binary frame.
+- **Import.** `import-cache --spawns <locations dir>` is opt-in, like
+  `--scenery`, and places onto whatever sectors the project has once the
+  landscape is written -- with `--no-landscape`, the ones made in the editor.
+  Ids are derived from project, list and row, so a re-import updates in place.
+  All 5514 shipped rows land on the 204 world.
+- **Export.** When a project has any entities, the export writes all three
+  lists in rsc-data's layout (amount 1 omitted, one row per line) and reads them
+  back as part of the gate. A project with none writes none, so loading its
+  export leaves the server's own lists alone. A few shipped NPC rows order their
+  keys differently from the rest; values, not key order, are compared.
+- **NPCs and items are drawn as the client draws them** (`EntitySprites`,
+  `entity-compose.ts`): camera-facing pictures, NPCs at their definition's
+  width and height and items at 96x64. An NPC is composed from its 12
+  animation slots in the client's front-facing layer order (head over body over
+  legs), each layer's full box stretched to one size; grey pixels are
+  multiplied by the layer's colour (animation colour 1/2/3 = the NPC's hair,
+  top, bottom) and r=255, g=b pixels by the skin colour, `(c * k) >> 8`, with 0
+  meaning white. NPC colours are used exactly as stored: many are 1 or 2,
+  which comes out near-black, as in the client. Anything without a picture
+  keeps its line marker; a "sprites" toggle switches to markers.
+- **Doors** are drawn as a frame on their edge. The map under a real door is a
+  hidden placeholder wall (section 18); the Walls tool's "server door" option
+  places the entity, and the plain tool the placeholder.
+
+## 20. The asset library: keys over content-addressed bytes, written back by patching
+
+Models, texture images, NPC sprite sets and item sprites can be browsed,
+added, replaced, renamed, reordered, downloaded and deleted from the Assets
+screen. Not edited: the editor converts files, it does not paint them. Schema
+change approved by the project owner (CLAUDE.md rule 4).
+
+- **Storage.** `asset_blobs` holds bytes by sha256 and is never rewritten;
+  `library_assets` maps (project, kind, key) to a hash. Replacing an asset is
+  repointing a key, so undo and snapshot export can point it back. Keys are
+  lowercase for named kinds, because the client finds `.jag` entries by a
+  case-insensitive hash; item sprites are keyed by position.
+- **Seeding is lazy and deterministic.** A project's library is filled from its
+  imported archives on first use. Because seeding the same archives always
+  gives the same entries, the export seeds the ORIGINAL archives again and
+  diffs: only archives with a difference are rewritten, and only their changed
+  entries.
+- **Archives are patched, not rebuilt.** Changed sprites get new headers
+  appended to the shared `index.dat`; untouched ones keep their bytes, and
+  entries nothing names (they cannot even be listed -- keys are one-way hashes)
+  survive. When the 16-bit index would overflow, textures and NPC sprites fall
+  back to a full rebuild, since every frame count there is known. media58 is
+  only ever patched: its interface sprites are listed nowhere in the cache.
+  The sprite encoder is the reader's exact inverse: textures17 and entity24
+  rebuild byte for byte.
+- **`.jag` compression is ambiguous.** An entry counts as compressed only when
+  its compressed size differs from its real size, so an entry whose bzip2 output
+  is exactly as long as its input reads back as garbage -- in the archiver and
+  in the client. `Spellcharge1.ob3` in models36.jag is one. `packArchive`
+  verifies every entry and falls back to whole-archive compression; the
+  landscape export uses it too.
+- **References follow.** Positional assets are referenced by index (texture n in
+  walls, tiles, roofs and model faces; item sprite n; animation n in NPCs'
+  12 slots), models by name (objects, and 20 animated models the 204 client
+  loads itself). A move or removal is a mapping; the server turns it into
+  definition updates and model replacements in the same batch, and refuses a
+  removal anything still uses.
+- **One path for project-wide ops.** Definition and asset ops are validated
+  against stored state and applied and logged in one transaction by
+  `applyProjectOps`, whether they come from a library route or the socket
+  (edits, undo, redo). Before this, the socket refused definition ops and the
+  definition editor's changes never reached the database. Definition ops gained
+  `definition.add` / `definition.remove` (the last row only; tables stay dense).
+- **Previews before broadcast.** The model, texture atlas and sprite sheet
+  previews are rebuilt in `ctx.beforeBroadcast`, before the ops go out, so a
+  peer that refetches on `op.applied` gets the new ones.
+- **OBJ.** One unit is one tile; OBJ = (-x, -y, z), the editor's half-turn,
+  which keeps orientation, so a counter-clockwise face shows its front fill.
+  Back-only faces are written reversed and two-sided faces with different fills
+  twice; all 408 shipped models draw identically after a round trip, though not
+  byte-identically -- the `.ob3` download is.
+- **Client limits (204).** Item sprites 48x32, at most 1000 (450 shipped);
+  textures 64 or 128 square, about 780 slots. NPC sprites: `loadEntities`
+  gives every distinct (case-insensitive) name in the animation table a block
+  of 27 slots below slot 2000, pictures or not, so 74 names fit and the shipped
+  cache uses 62. `MAX_SPRITE_SETS` is enforced on every animation-table change
+  (library routes, the definitions route, socket edits and undo) after the
+  whole batch, and again by the export. Animations that reuse a name are free. Sprites hold
+  254 colours plus the transparency key; item sprites share one palette per
+  file of 30.
+- **Interface sprites (`uiSprite`).** The client asks for media58's interface
+  sprites by name with frame counts written in its code (`loadMedia`), so
+  `UI_SPRITES` in `ui-sprites.ts` is that list; `projectile`'s count comes from
+  the config and is measured as the count that consumes the entry exactly. They
+  are replace-only, and keep their size except the title logo (`runescape`,
+  centred, up to 512x185). jagex.jag's `logo.tga` is the same kind under key
+  `logo`, stored as the TGA itself: 256-colour, colour-mapped, bottom row first,
+  palette at byte 18 and pixels at 786 -- the Java client reads those offsets
+  without parsing the header, so exactly that layout is written. Libraries
+  seeded before the kind existed get it on next use (`LATE_KINDS`), and the
+  export never reads a missing interface sprite as a removal. Both logos,
+  replaced, verified drawn by rsc-client 204.
+

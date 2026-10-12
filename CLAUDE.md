@@ -121,8 +121,19 @@ change there, say so in your report rather than making it.
 - Phases 4-5 — see `PLAN.md`
 
 Not yet verified anywhere: the Discord OAuth **callback** (needs a real Discord
-app), the definition forms in a browser, a real-cache project in the e2e
-suite (it builds an empty one), and an exported cache loaded in a real client.
+app), the definition forms in a browser, and a real-cache project in the e2e
+suite (it builds an empty one). An exported cache, with a replaced texture, has
+been loaded by the 2003scape web client (rsc-client, 204) and drawn on its
+title screen; play past login has not been checked by the editor's tests.
+
+**NPCs, ground items and doors** are per-sector entities beside the lanes
+(DECISIONS §19): NPC and Item tools, a server-door option on Walls, imported with
+`--spawns`, exported as the game server's three lists.
+
+**The asset library** (models, textures, NPC and item sprites, and the
+client's interface sprites and logos) lives beside
+the definitions (DECISIONS §20): browse, upload, replace, reorder and delete from
+the Assets screen, references rewritten server-side, archives patched on export.
 
 **The `.hei` format only holds even elevation and colour values** (DECISIONS
 §15). Anything that writes those lanes must go through `clampLane`.

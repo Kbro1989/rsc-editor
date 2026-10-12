@@ -56,17 +56,28 @@ const OP_LABELS: Record<string, string> = {
   'scenery.remove': 'Remove scenery',
   'region.fill': 'Fill region',
   'region.paste': 'Paste region',
-  'definition.update': 'Edit definition'
+  'definition.update': 'Edit definition',
+  'entity.add': 'Place',
+  'entity.update': 'Edit',
+  'entity.remove': 'Remove',
+  'definition.add': 'Add definition',
+  'definition.remove': 'Remove definition',
+  'asset.put': 'Update asset',
+  'asset.remove': 'Remove asset'
 };
 
 export function describeOp(op: Op): string {
   const label = OP_LABELS[op.kind] ?? op.kind;
   if (op.type === 'definition') return `${label} (${op.defKind} #${op.index})`;
+  if (op.type === 'entity') return `${label} ${(op.to ?? op.from)?.kind ?? 'entity'}`;
+  if (op.type === 'asset') return `${label} (${op.assetKind} ${op.key})`;
   return label;
 }
 
 export function opTileCount(op: Op): number {
-  return op.type === 'sector' ? op.changes.length : Object.keys(op.to).length;
+  if (op.type === 'sector') return op.changes.length;
+  if (op.type === 'entity' || op.type === 'asset') return 1;
+  return Object.keys(op.to).length;
 }
 
 /** crypto.randomUUID is not available on insecure origins in every browser. */

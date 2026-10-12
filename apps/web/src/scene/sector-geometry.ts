@@ -114,6 +114,8 @@ export interface SectorGeometrySet {
   originZ: number;
   terrain: BufferGeometry | null;
   walls: BufferGeometry | null;
+  /** walls the client hides, drawn as a wireframe on request */
+  hiddenWalls: BufferGeometry | null;
   roofs: BufferGeometry | null;
   /**
    * `triangleTiles` of the terrain geometry, kept so a raycast hit can be turned
@@ -169,6 +171,24 @@ export interface SceneryDraw {
   triangles: number;
 }
 
+interface ColourSets {
+  shaded: BufferAttribute;
+  plain: BufferAttribute;
+}
+
+/**
+ * Switch a geometry between the client's shading and the editor's plain
+ * colours (`GeometryData.plainColours`), without re-meshing: both sets were
+ * uploaded with it, so this swaps which attribute is bound. A geometry built
+ * without a plain set (scenery) keeps its shading either way.
+ */
+export function setShading(geometry: BufferGeometry, shaded: boolean): void {
+  const sets = geometry.userData.colourSets as ColourSets | undefined;
+  if (!sets) return;
+  const want = shaded ? sets.shaded : sets.plain;
+  if (geometry.getAttribute('color') !== want) geometry.setAttribute('color', want);
+}
+
 /**
  * Build one three geometry from one `GeometryData`.
  *
@@ -186,7 +206,12 @@ export function toBufferGeometry(
 
   const geometry = new BufferGeometry();
   geometry.setAttribute('position', new BufferAttribute(data.positions, 3));
-  geometry.setAttribute('color', new BufferAttribute(data.colours, 3));
+  const shaded = new BufferAttribute(data.colours, 3);
+  geometry.setAttribute('color', shaded);
+  if (data.plainColours) {
+    const plain: ColourSets = { shaded, plain: new BufferAttribute(data.plainColours, 3) };
+    geometry.userData.colourSets = plain;
+  }
   geometry.setAttribute('normal', new BufferAttribute(data.normals, 3));
   geometry.setAttribute(
     'uv',
@@ -481,6 +506,7 @@ export class SectorGeometryCache {
       originZ,
       terrain: toBufferGeometry(result.terrain, this.layout),
       walls: toBufferGeometry(result.walls, this.layout),
+      hiddenWalls: toBufferGeometry(result.hiddenWalls, this.layout),
       roofs: toBufferGeometry(result.roofs, this.layout),
       terrainTiles: result.terrain.triangleTiles,
       absoluteWalls: result.absoluteWalls,
@@ -717,6 +743,7 @@ export class SectorGeometryCache {
 function dispose(entry: SectorGeometrySet): void {
   entry.terrain?.dispose();
   entry.walls?.dispose();
+  entry.hiddenWalls?.dispose();
   entry.roofs?.dispose();
 }
 

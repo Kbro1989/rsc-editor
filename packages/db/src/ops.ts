@@ -225,12 +225,22 @@ function targetColumns(
   | 'targetDefKind'
   | 'targetDefIndex'
 > {
-  if (op.type === 'sector') {
+  if (op.type === 'sector' || op.type === 'entity') {
     return {
       targetSectorId: sectorIds?.get(sectorKey(op.sector)) ?? null,
       targetPlane: op.sector.plane,
       targetX: op.sector.x,
       targetY: op.sector.y,
+      targetDefKind: null,
+      targetDefIndex: null
+    };
+  }
+  if (op.type === 'asset') {
+    return {
+      targetSectorId: null,
+      targetPlane: null,
+      targetX: null,
+      targetY: null,
       targetDefKind: null,
       targetDefIndex: null
     };

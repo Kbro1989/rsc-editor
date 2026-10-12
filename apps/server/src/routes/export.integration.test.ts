@@ -1,9 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
-import { exportWorld, loadConfig as loadCacheConfig, loadLandscape } from '@rsc-editor/cache';
+import {
+  DEFINITION_FILES,
+  exportWorld,
+  loadConfig as loadCacheConfig,
+  loadLandscape
+} from '@rsc-editor/cache';
 import {
   cacheAssets,
   createDb,
@@ -12,6 +18,7 @@ import {
   definitions,
   putMember,
   putSector,
+  setUserAccess,
   upsertUserFromDiscord,
   type Database,
   type DbHandle
@@ -186,7 +193,7 @@ describe.skipIf(!available)('project export', () => {
     expect(res.headers['content-type']).toBe('application/zip');
     expect(res.headers['content-disposition']).toMatch(/attachment; filename=".+-cache\.zip"/);
     expect(zipNames(res.rawPayload).sort()).toEqual(
-      [...ARCHIVES, 'object-locs.json', 'export-report.json'].sort()
+      [...ARCHIVES, 'object-locs.json', 'export-report.json', ...Object.values(DEFINITION_FILES)].sort()
     );
   });
 
@@ -247,6 +254,181 @@ describe.skipIf(!available)('project export', () => {
       headers: { cookie: viewer.cookie }
     });
     expect(res.statusCode).toBe(403);
+  });
+
+  describe('publish', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rsc-publish-'));
+    let publishing: FastifyInstance;
+
+    beforeAll(async () => {
+      publishing = await buildApp({
+        config: { ...config, publish: { dir, gameUrl: 'https://game.example.com' } },
+        db
+      });
+      await publishing.ready();
+    });
+
+    afterAll(async () => {
+      await publishing?.close();
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const clear = () => {
+      rmSync(join(dir, 'inbox'), { recursive: true, force: true });
+      rmSync(join(dir, 'status.json'), { force: true });
+    };
+
+    async function admin() {
+      const project = await seeded({ archives: true });
+      await setUserAccess(db, project.userId, { globalRole: 'admin' });
+      return project;
+    }
+
+    it('queues exactly what Export would hand you, zip first, then the request', async () => {
+      clear();
+      const { projectId, cookie } = await admin();
+      const res = await publishing.inject({
+        method: 'POST',
+        url: `/api/projects/${projectId}/publish`,
+        headers: { cookie }
+      });
+      expect(res.statusCode).toBe(202);
+
+      const zip = readFileSync(join(dir, 'inbox/cache.zip'));
+      expect(zipNames(zip).sort()).toEqual(
+        [...ARCHIVES, 'object-locs.json', 'export-report.json', ...Object.values(DEFINITION_FILES)].sort()
+      );
+      const request = JSON.parse(readFileSync(join(dir, 'inbox/request.json'), 'utf8'));
+      expect(request).toMatchObject({ id: res.json().queued.id, projectId });
+      // Nothing half-written is left beside them.
+      expect(existsSync(join(dir, 'inbox/cache.zip.tmp'))).toBe(false);
+      expect(existsSync(join(dir, 'inbox/request.json.tmp'))).toBe(false);
+
+      // A second click while the first waits is refused, not queued over it.
+      const again = await publishing.inject({
+        method: 'POST',
+        url: `/api/projects/${projectId}/publish`,
+        headers: { cookie }
+      });
+      expect(again.statusCode).toBe(409);
+
+      const status = await publishing.inject({ method: 'GET', url: '/api/publish', headers: { cookie } });
+      expect(status.json()).toMatchObject({
+        enabled: true,
+        gameUrl: 'https://game.example.com',
+        queued: { id: request.id }
+      });
+    });
+
+    it('reports what the game server wrote back, and refuses while it installs', async () => {
+      clear();
+      const { projectId, cookie } = await admin();
+      writeFileSync(join(dir, 'status.json'), JSON.stringify({ id: 'x', state: 'running' }));
+      const busy = await publishing.inject({
+        method: 'POST',
+        url: `/api/projects/${projectId}/publish`,
+        headers: { cookie }
+      });
+      expect(busy.statusCode).toBe(409);
+
+      writeFileSync(join(dir, 'status.json'), JSON.stringify({ id: 'x', state: 'done', message: 'live' }));
+      const res = await publishing.inject({ method: 'GET', url: '/api/publish', headers: { cookie } });
+      expect(res.json()).toMatchObject({ queued: null, status: { id: 'x', state: 'done' } });
+    });
+
+    it('is for admins: an owner who is not one gets 403 and no button', async () => {
+      clear();
+      const { projectId, cookie } = await seeded({ archives: true });
+      const res = await publishing.inject({
+        method: 'POST',
+        url: `/api/projects/${projectId}/publish`,
+        headers: { cookie }
+      });
+      expect(res.statusCode).toBe(403);
+      expect(existsSync(join(dir, 'inbox/request.json'))).toBe(false);
+
+      const status = await publishing.inject({ method: 'GET', url: '/api/publish', headers: { cookie } });
+      expect(status.json()).toMatchObject({ enabled: false, gameUrl: 'https://game.example.com', queued: null });
+    });
+
+    it('does not exist on an install without a game server', async () => {
+      const { projectId, cookie } = await admin();
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/projects/${projectId}/publish`,
+        headers: { cookie }
+      });
+      expect(res.statusCode).toBe(404);
+      const status = await app.inject({ method: 'GET', url: '/api/publish', headers: { cookie } });
+      expect(status.json()).toEqual({ enabled: false, gameUrl: null, queued: null, status: null });
+    });
+  });
+
+  describe('new definitions copied from existing ones', () => {
+    it('a copied coffin exports, with its own name and the same model', async () => {
+      const { projectId, cookie } = await seeded({ archives: true });
+      const parsed = loadCacheConfig(read('config85.jag'));
+      const coffin = parsed.objects.findIndex((o) => /coffin/i.test(o.name));
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/projects/${projectId}/definitions/objects`,
+        headers: { cookie },
+        payload: { copyOf: coffin, changes: { name: 'Old coffin', description: 'Older than the rest' } }
+      });
+      expect(res.statusCode).toBe(201);
+      const { index } = res.json();
+      expect(index).toBe(parsed.objects.length);
+
+      // The export gate compares every definition exactly: this is the proof.
+      const exported = await app.inject({ method: 'GET', url: `/api/projects/${projectId}/export`, headers: { cookie } });
+      expect(exported.statusCode).toBe(200);
+      const got = await app.inject({ method: 'GET', url: `/api/projects/${projectId}/definitions/objects/${index}`, headers: { cookie } });
+      expect(got.json().data).toMatchObject({
+        name: 'Old coffin',
+        description: 'Older than the rest',
+        model: { name: parsed.objects[coffin]!.model.name }
+      });
+    });
+
+    it('copies items, NPCs and wall objects too, and says where the room runs out', async () => {
+      const { projectId, cookie } = await seeded({ archives: true });
+      const add = (kind: string, payload: unknown) =>
+        app.inject({ method: 'POST', url: `/api/projects/${projectId}/definitions/${kind}`, headers: { cookie }, payload: payload as Record<string, unknown> });
+      for (const kind of ['items', 'npcs', 'wallObjects']) {
+        expect((await add(kind, { copyOf: 0, changes: { name: `new ${kind}` } })).statusCode).toBe(201);
+      }
+      expect((await add('tiles', { copyOf: 0 })).statusCode).toBe(400);
+      // Text the archive would mangle is refused up front, with the reason.
+      const curly = await add('npcs', { copyOf: 5, changes: { description: 'Hans’s nephew' } });
+      expect(curly.statusCode).toBe(400);
+      expect(curly.json().message).toMatch(/description contains .*use '/);
+      expect((await add('items', { copyOf: 99999 })).statusCode).toBe(400);
+      const exported = await app.inject({ method: 'GET', url: `/api/projects/${projectId}/export`, headers: { cookie } });
+      expect(exported.statusCode).toBe(200);
+
+      // Wall objects stop at 255: the map holds a wall as one byte.
+      const walls = loadCacheConfig(read('config85.jag')).wallObjects.length + 1;
+      for (let i = walls; i < 255; i++) {
+        expect((await add('wallObjects', { copyOf: 0 })).statusCode).toBe(201);
+      }
+      const full = await add('wallObjects', { copyOf: 0 });
+      expect(full.statusCode).toBe(409);
+      expect(full.json().message).toMatch(/one byte/);
+    }, 120_000);
+
+    it('is for editors, not viewers', async () => {
+      const { projectId } = await seeded({ archives: true });
+      const viewer = await login();
+      await putMember(db, projectId, viewer.userId, 'viewer');
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/projects/${projectId}/definitions/items`,
+        headers: { cookie: viewer.cookie },
+        payload: { copyOf: 0 }
+      });
+      expect(res.statusCode).toBe(403);
+    });
   });
 
   it('matches exportWorld called directly on the same state', () => {

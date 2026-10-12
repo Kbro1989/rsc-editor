@@ -18,11 +18,15 @@ import { isHttpError } from './errors.js';
 import { registerDevLogin } from './auth/dev-login.js';
 import { registerDiscordAuth } from './auth/discord.js';
 import { registerSessionAuth } from './auth/session.js';
+import { registerAudit } from './audit.js';
 import { registerAccessRoutes } from './routes/access.js';
 import { registerCacheAssetRoutes } from './routes/cache-assets.js';
 import { registerDefinitionRoutes } from './routes/definitions.js';
 import { registerExportRoutes } from './routes/export.js';
+import { registerPublishRoutes } from './routes/publish.js';
+import { registerWorldRoutes } from './routes/worlds.js';
 import { registerHistoryRoutes } from './routes/history.js';
+import { registerLibraryRoutes } from './routes/library.js';
 import { registerMeRoutes } from './routes/me.js';
 import { registerMemberRoutes } from './routes/members.js';
 import { registerOpRoutes } from './routes/ops.js';
@@ -46,7 +50,13 @@ export async function buildApp(
   options: BuildAppOptions
 ): Promise<FastifyInstance> {
   const config = options.config ?? loadConfig();
-  const ctx: AppContext = { config, db: options.db, accessChanged: new Set() };
+  const ctx: AppContext = {
+    config,
+    db: options.db,
+    accessChanged: new Set(),
+    opsApplied: new Set(),
+    beforeBroadcast: new Set()
+  };
 
   const app = Fastify({
     logger: {
@@ -72,6 +82,8 @@ export async function buildApp(
   registerErrorHandler(app);
 
   await registerSessionAuth(app, ctx);
+  // Before any route: a hook only reaches routes registered after it.
+  registerAudit(app, ctx);
   await registerDiscordAuth(app, ctx);
 
   // An authentication bypass, gated on NODE_ENV + RSC_DEV_LOGIN + a loopback
@@ -92,8 +104,11 @@ export async function buildApp(
   await registerDefinitionRoutes(app, ctx);
   await registerCacheAssetRoutes(app, ctx);
   await registerExportRoutes(app, ctx);
+  await registerPublishRoutes(app, ctx);
+  await registerWorldRoutes(app, ctx);
   await registerHistoryRoutes(app, ctx);
   await registerAccessRoutes(app, ctx);
+  await registerLibraryRoutes(app, ctx);
 
   app.get('/api/health', async () => ({ ok: true }));
 

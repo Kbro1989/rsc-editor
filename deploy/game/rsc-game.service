@@ -1,0 +1,30 @@
+# The 2003scape game server. Reads the cache (rsc-data) once, at startup,
+# which is why a publish restarts it. Installed by deploy/game/install.sh.
+[Unit]
+Description=RSC game server
+After=network.target rsc-game-data.service
+Requires=rsc-game-data.service
+
+[Service]
+Type=simple
+User=rscgame
+Group=rscgame
+WorkingDirectory=/opt/rsc-game/rsc-server
+# It connects to the data server's socket once, on startup, and gives up if
+# it is not there yet.
+ExecStartPre=/bin/sh -c 'for i in $(seq 100); do [ -S /run/rsc-game/data-server.sock ] && exit 0; sleep 0.1; done; echo "no data server socket" >&2; exit 1'
+ExecStart=/usr/bin/node src/bin.js -c /etc/rsc-game/server.json -v info
+# always: a restart from the Worlds screen is the world counting down and
+# exiting cleanly, and it has to come back. `systemctl stop` still stops it.
+Restart=always
+RestartSec=3
+# SIGTERM logs every player out, which saves them; give that time.
+TimeoutStopSec=30
+NoNewPrivileges=true
+# Game events wait here until the editor has stored them
+# (rsc-server/src/admin/events.js); /var/lib/rsc-game-events.
+StateDirectory=rsc-game-events
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

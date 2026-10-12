@@ -41,7 +41,14 @@ import {
   uniqueIndex,
   uuid
 } from 'drizzle-orm/pg-core';
-import type { DefinitionKind, Op } from '@rsc-editor/schema';
+import type {
+  DefinitionKind,
+  EntityData,
+  EntityKind,
+  LibraryKind,
+  LibraryMeta,
+  Op
+} from '@rsc-editor/schema';
 
 /**
  * `bytea`. Drizzle has no built-in for it.
@@ -410,6 +417,83 @@ export const definitions = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// server-side placements
+// ---------------------------------------------------------------------------
+
+/**
+ * NPC spawns, ground items and doors: what the game server places, and the
+ * cache does not hold (`EntityData` in @rsc-editor/schema).
+ *
+ * One row per live entity; a removed entity's row is deleted, and its history
+ * is the op log. `id` is the entity id the ops refer to, so it is supplied by
+ * the client that created it rather than defaulted. The sector FK cascades: a
+ * sector that goes takes its placements with it.
+ */
+export const entities = pgTable(
+  'entities',
+  {
+    id: uuid('id').primaryKey(),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    sectorId: uuid('sector_id')
+      .notNull()
+      .references(() => sectors.id, { onDelete: 'cascade' }),
+    /** mirrors `data.kind`, for "every door in this project" without jsonb */
+    kind: text('kind').$type<EntityKind>().notNull(),
+    data: jsonb('data').$type<EntityData>().notNull(),
+    updatedAt: updatedAt(),
+    updatedBy: uuid('updated_by').references(() => users.id, {
+      onDelete: 'set null'
+    })
+  },
+  (t) => [
+    // subscribe streams a sector's entities; export streams a kind
+    index('entities_sector_idx').on(t.sectorId),
+    index('entities_project_kind_idx').on(t.projectId, t.kind)
+  ]
+);
+
+// ---------------------------------------------------------------------------
+// asset library
+// ---------------------------------------------------------------------------
+
+/**
+ * Content-addressed bytes for the asset library. Shared by every project and
+ * never rewritten: replacing an asset stores new bytes under a new hash and
+ * repoints the library entry, so the old bytes are still there for an undo or
+ * a snapshot export.
+ */
+export const assetBlobs = pgTable('asset_blobs', {
+  sha256: text('sha256').primaryKey(),
+  byteLength: integer('byte_length').notNull(),
+  data: bytea('data').notNull(),
+  createdAt: createdAt()
+});
+
+/**
+ * A project's models, texture images, NPC sprite sets and item sprites
+ * (`LibraryKind` in @rsc-editor/schema), each a key pointing at a blob.
+ */
+export const libraryAssets = pgTable(
+  'library_assets',
+  {
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    kind: text('kind').$type<LibraryKind>().notNull(),
+    key: text('key').notNull(),
+    sha256: text('sha256')
+      .notNull()
+      .references(() => assetBlobs.sha256, { onDelete: 'restrict' }),
+    meta: jsonb('meta').$type<LibraryMeta>().notNull(),
+    updatedAt: updatedAt(),
+    updatedBy: uuid('updated_by').references(() => users.id, { onDelete: 'set null' })
+  },
+  (t) => [primaryKey({ name: 'library_assets_pkey', columns: [t.projectId, t.kind, t.key] })]
+);
+
+// ---------------------------------------------------------------------------
 // op log
 // ---------------------------------------------------------------------------
 
@@ -434,13 +518,13 @@ export const ops = pgTable(
     actorId: uuid('actor_id')
       .notNull()
       .references(() => users.id, { onDelete: 'restrict' }),
-    /** 'sector' | 'definition' -- the op discriminator. */
+    /** 'sector' | 'definition' | 'entity' | 'asset' -- the op discriminator. */
     opType: text('op_type').$type<Op['type']>().notNull(),
     /** the op's `kind`, e.g. 'elevation.raise'. History UI labels only. */
     opKind: text('op_kind').notNull(),
 
     // --- target, denormalised out of the payload so it can be indexed ---
-    /** set for sector ops; null for definition ops. */
+    /** set for sector and entity ops; null for definition ops. */
     targetSectorId: uuid('target_sector_id').references(() => sectors.id, {
       onDelete: 'set null'
     }),
@@ -526,6 +610,71 @@ export type SectorRow = typeof sectors.$inferSelect;
 export type NewSectorRow = typeof sectors.$inferInsert;
 export type SectorLock = typeof sectorLocks.$inferSelect;
 export type DefinitionRow = typeof definitions.$inferSelect;
+/* ---------------------------------------------------------------- audit -- */
+
+/**
+ * Every action an admin took through the editor on something other than a
+ * map: a world (kick, broadcast, restart), a publish, the access list.
+ * Append-only -- no route updates or deletes a row -- and kept for good. Map
+ * edits have their own permanent record, the op log.
+ */
+export const adminAudit = pgTable(
+  'admin_audit',
+  {
+    id: bigint('id', { mode: 'number' }).primaryKey().generatedAlwaysAsIdentity(),
+    at: timestamp('at', { withTimezone: true }).notNull().defaultNow(),
+    actorId: uuid('actor_id').references(() => users.id, { onDelete: 'set null' }),
+    /** kept as written: the account may be renamed or removed later */
+    actorName: text('actor_name').notNull(),
+    /** 'world.kick', 'world.broadcast', 'world.restart', 'publish', 'access.revoke', ... */
+    action: text('action').notNull(),
+    worldId: text('world_id'),
+    /** the player, project or account acted on */
+    target: text('target'),
+    details: jsonb('details').$type<Record<string, unknown>>().notNull().default({}),
+    /** 'ok', or why it failed */
+    result: text('result').notNull()
+  },
+  (t) => [
+    index('admin_audit_at_idx').on(t.at),
+    index('admin_audit_target_idx').on(t.target, t.at),
+    index('admin_audit_actor_idx').on(t.actorName, t.at)
+  ]
+);
+
+/**
+ * What happened in the game worlds, as each world reported it over its
+ * control socket: logins, chat, private messages, drops, pickups, deaths,
+ * commands. `seq` is the world's own number for the event, so a replay after
+ * a disconnect cannot store one twice. Kept per type for as long as
+ * GAME_EVENT_RETENTION says, then deleted.
+ */
+export const gameEvents = pgTable(
+  'game_events',
+  {
+    id: bigint('id', { mode: 'number' }).primaryKey().generatedAlwaysAsIdentity(),
+    worldId: text('world_id').notNull(),
+    seq: bigint('seq', { mode: 'number' }).notNull(),
+    at: timestamp('at', { withTimezone: true }).notNull(),
+    type: text('type').notNull(),
+    player: text('player'),
+    /** the other party: a PM's recipient, a killer, a kicked player */
+    other: text('other'),
+    details: jsonb('details').$type<Record<string, unknown>>().notNull().default({})
+  },
+  (t) => [
+    uniqueIndex('game_events_world_seq_idx').on(t.worldId, t.seq),
+    index('game_events_player_idx').on(t.player, t.at),
+    index('game_events_other_idx').on(t.other, t.at),
+    index('game_events_type_idx').on(t.type, t.at),
+    index('game_events_at_idx').on(t.at)
+  ]
+);
+
+export type AdminAuditRow = typeof adminAudit.$inferSelect;
+export type GameEventRow = typeof gameEvents.$inferSelect;
+export type EntityRow = typeof entities.$inferSelect;
+export type LibraryAssetRow = typeof libraryAssets.$inferSelect;
 export type OpRow = typeof ops.$inferSelect;
 export type NewOpRow = typeof ops.$inferInsert;
 export type Snapshot = typeof snapshots.$inferSelect;

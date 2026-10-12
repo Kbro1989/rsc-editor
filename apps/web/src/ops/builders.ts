@@ -95,7 +95,7 @@ function brushTiles(
  * Accumulates (worldTile, lane, newValue) writes and emits one op per sector.
  * This is where CLAUDE.md rule 6 is actually enforced.
  */
-class DeltaCollector {
+export class DeltaCollector {
   private readonly bySector = new Map<string, { coord: SectorCoord; changes: TileDelta[] }>();
   private readonly missing = new Map<string, SectorCoord>();
   readonly conflicts: string[] = [];
@@ -264,6 +264,145 @@ export function buildPaintOp(centre: WorldTile, brush: PaintBrush, read: SectorR
   return c.finish(brush.lane === 'colour' ? 'paint.colour' : 'paint.overlay');
 }
 
+/* ----------------------------------------------------------------- holes -- */
+
+/**
+ * Overlays whose tile definition is a hole (`type: 'hole'`), as lane values.
+ * The shipped cache has two: 8, drawn as nothing at all (see-through), and
+ * 10, drawn black. Both block movement. Read from the config rather than
+ * hard-coded, so a project that adds or reorders tile definitions still works.
+ */
+export function holeOverlays(tiles: readonly { type: string | null }[]): number[] {
+  return tiles.flatMap((t, i) => (t.type === 'hole' ? [i + 1] : []));
+}
+
+/**
+ * Make holes (`overlay` = a hole overlay) under the brush, or with `overlay`
+ * null fill them back in: only tiles that ARE holes go back to no overlay, so
+ * filling a hole next to a path does not strip the path.
+ */
+export function buildHoleOp(
+  centre: WorldTile,
+  brush: { radius: number; shape: BrushShape; overlay: number | null },
+  holes: readonly number[],
+  read: SectorReader
+): BuildResult {
+  const c = new DeltaCollector(read);
+  for (const { tile } of brushTiles(centre, brush.radius, brush.shape, 'constant')) {
+    if (brush.overlay !== null) {
+      c.write(tile, 'overlay', brush.overlay);
+      continue;
+    }
+    const current = c.peek(tile, 'overlay');
+    // undefined: not loaded -- the write records the sector as missing.
+    if (current === undefined || holes.includes(current)) c.write(tile, 'overlay', 0);
+  }
+  return c.finish('paint.overlay');
+}
+
+/* ---------------------------------------------------------------- eraser -- */
+
+/** What the eraser takes off the map lanes. NPCs, items and doors are entities; see gesture.ts. */
+export interface EraseLanes {
+  radius: number;
+  shape: BrushShape;
+  scenery: boolean;
+  walls: boolean;
+  overlay: boolean;
+  roofs: boolean;
+}
+
+/** The tiles a flat brush covers. */
+export function brushWorldTiles(centre: WorldTile, radius: number, shape: BrushShape): WorldTile[] {
+  return brushTiles(centre, radius, shape, 'constant').map((t) => t.tile);
+}
+
+/**
+ * Clear everything selected under the brush, as one op per sector and
+ * category. A scenery object is removed whole when the brush touches any of
+ * its tiles -- the same rule as the Scenery tool's remove, for the same
+ * reason: the export cannot reproduce half an object. Walls are all three
+ * lanes of each tile; a diagonal lane holding scenery is left to `scenery`.
+ */
+export function buildEraseOp(
+  centre: WorldTile,
+  brush: EraseLanes,
+  read: SectorReader,
+  objects: readonly SceneryFootprint[]
+): BuildResult {
+  const tiles = brushWorldTiles(centre, brush.radius, brush.shape);
+  const parts: BuildResult[] = [];
+
+  if (brush.walls) {
+    const c = new DeltaCollector(read);
+    for (const t of tiles) {
+      c.write(t, 'wallsHorizontal', 0);
+      c.write(t, 'wallsVertical', 0);
+      const diagonal = c.peek(t, 'wallsDiagonal');
+      if (diagonal !== undefined && diagonal > 0 && diagonal < OBJECT_OFFSET) c.write(t, 'wallsDiagonal', 0);
+    }
+    parts.push(c.finish('wall.clear'));
+  }
+
+  if (brush.overlay) {
+    const c = new DeltaCollector(read);
+    for (const t of tiles) c.write(t, 'overlay', 0);
+    parts.push(c.finish('paint.overlay'));
+  }
+
+  if (brush.roofs) {
+    const c = new DeltaCollector(read);
+    for (const t of tiles) c.write(t, 'wallsRoof', 0);
+    parts.push(c.finish('roof.set'));
+  }
+
+  if (brush.scenery) {
+    const c = new DeltaCollector(read);
+    const bySector = new Map<string, { coord: SectorCoord; found: SceneryAt[] }>();
+    const cleared = new Set<string>();
+    for (const t of tiles) {
+      const at = sectorOf(t, read);
+      if (!at) continue;
+      if (!at.buffers) {
+        c.write(t, 'wallsDiagonal', 0); // records the sector as missing
+        continue;
+      }
+      const key = sectorKey(at.coord);
+      let sector = bySector.get(key);
+      if (!sector) {
+        sector = { coord: at.coord, found: sceneryInSector(at.buffers, objects) };
+        bySector.set(key, sector);
+      }
+      const object = sector.found.find((o) => o.tiles.includes(at.i));
+      if (!object || cleared.has(`${key}:${object.origin}`)) continue;
+      cleared.add(`${key}:${object.origin}`);
+      for (const i of object.tiles) {
+        const w = worldOf(sector.coord, i);
+        c.write(w, 'wallsDiagonal', 0);
+        c.write(w, 'direction', 0);
+      }
+    }
+    parts.push(c.finish('scenery.remove'));
+  }
+
+  return mergeResults(parts);
+}
+
+function mergeResults(parts: readonly BuildResult[]): BuildResult {
+  const missing = new Map<string, SectorCoord>();
+  const touched = new Map<string, SectorCoord>();
+  const out: BuildResult = { ops: [], missing: [], touched: [], conflicts: [] };
+  for (const p of parts) {
+    out.ops.push(...p.ops);
+    for (const m of p.missing) missing.set(sectorKey(m), m);
+    for (const t of p.touched) touched.set(sectorKey(t), t);
+    out.conflicts.push(...p.conflicts);
+  }
+  out.missing = [...missing.values()];
+  out.touched = [...touched.values()];
+  return out;
+}
+
 /* ----------------------------------------------------------------- walls -- */
 
 export const WALL_EDGES = ['horizontal', 'vertical', 'diagonal-nesw', 'diagonal-nwse'] as const;
@@ -277,17 +416,26 @@ export const WALL_EDGE_LABELS: Record<WallEdge, string> = {
 };
 
 /** wallId 0 clears. */
+/**
+ * Place wall definition `wallId` (zero-based into `config.wallObjects`), or
+ * clear the edge when it is `null`.
+ *
+ * The lanes store `wallId + 1`, so 0 can mean "no wall" (`World#loadSection`
+ * and the renderer both read `value - 1`). Writing the picker's index as-is
+ * drew the definition before the one chosen, and made wall 0 unplaceable.
+ */
 export function buildWallOp(
   tile: WorldTile,
   edge: WallEdge,
-  wallId: number,
+  wallId: number | null,
   read: SectorReader
 ): BuildResult {
   const c = new DeltaCollector(read);
-  const kind: OpKind = wallId === 0 ? 'wall.clear' : 'wall.set';
+  const kind: OpKind = wallId === null ? 'wall.clear' : 'wall.set';
+  const stored = wallId === null ? 0 : wallId + 1;
 
   if (edge === 'horizontal' || edge === 'vertical') {
-    c.write(tile, edge === 'horizontal' ? 'wallsHorizontal' : 'wallsVertical', wallId);
+    c.write(tile, edge === 'horizontal' ? 'wallsHorizontal' : 'wallsVertical', stored);
     return c.finish(kind);
   }
 
@@ -301,7 +449,7 @@ export function buildWallOp(
     return c.finish(kind);
   }
 
-  const value = wallId === 0 ? 0 : edge === 'diagonal-nwse' ? wallId + NW_SE_OFFSET : wallId;
+  const value = stored === 0 ? 0 : edge === 'diagonal-nwse' ? stored + NW_SE_OFFSET : stored;
   c.write(tile, 'wallsDiagonal', value);
   return c.finish(kind);
 }
@@ -339,7 +487,7 @@ export interface SceneryFootprint {
   height: number;
 }
 
-interface SceneryAt {
+export interface SceneryAt {
   id: number;
   direction: number;
   /** sector-local tile index of the origin */
@@ -349,7 +497,7 @@ interface SceneryAt {
 }
 
 /** `sceneryFootprint` in packages/cache: odd directions transpose, the sector edge clips. */
-function footprintTiles(origin: number, direction: number, def: SceneryFootprint): number[] {
+export function footprintTiles(origin: number, direction: number, def: SceneryFootprint): number[] {
   const ox = Math.floor(origin / SECTOR_WIDTH);
   const oy = origin % SECTOR_WIDTH;
   const square = direction === 0 || direction === 4;
@@ -369,7 +517,7 @@ function footprintTiles(origin: number, direction: number, def: SceneryFootprint
  * (`listPlacements`): an x-then-y scan, where the first unclaimed tile of an id
  * is its origin and claims the matching tiles of its footprint.
  */
-function sceneryInSector(buffers: SectorBuffers, objects: readonly SceneryFootprint[]): SceneryAt[] {
+export function sceneryInSector(buffers: SectorBuffers, objects: readonly SceneryFootprint[]): SceneryAt[] {
   const lane = buffers.wallsDiagonal;
   const claimed = new Uint8Array(lane.length);
   const out: SceneryAt[] = [];
@@ -401,7 +549,7 @@ function sectorOf(tile: WorldTile, read: SectorReader) {
   return { ...st, buffers: read(st.coord) };
 }
 
-function worldOf(coord: SectorCoord, i: number): WorldTile {
+export function worldOf(coord: SectorCoord, i: number): WorldTile {
   return {
     plane: coord.plane,
     wx: coord.x * SECTOR_WIDTH + Math.floor(i / SECTOR_WIDTH),
@@ -600,14 +748,15 @@ export function buildSceneryRepairOp(
   return { result: c.finish('scenery.place'), fixed, dropped };
 }
 
-/** Decode the multiplexed lane for display. */
+/** Decode the multiplexed lane for display. Wall ids are zero-based definition indices. */
 export function readDiagonalLane(
   value: number
 ): { kind: 'none' } | { kind: 'wall'; id: number; edge: WallEdge } | { kind: 'object'; id: number } {
   if (value <= 0) return { kind: 'none' };
   if (value >= OBJECT_OFFSET) return { kind: 'object', id: value - OBJECT_ID_BIAS };
-  if (value >= NW_SE_OFFSET) return { kind: 'wall', id: value - NW_SE_OFFSET, edge: 'diagonal-nwse' };
-  return { kind: 'wall', id: value, edge: 'diagonal-nesw' };
+  if (value > NW_SE_OFFSET) return { kind: 'wall', id: value - NW_SE_OFFSET - 1, edge: 'diagonal-nwse' };
+  if (value === NW_SE_OFFSET) return { kind: 'none' };
+  return { kind: 'wall', id: value - 1, edge: 'diagonal-nesw' };
 }
 
 /* ---------------------------------------------------------------- region -- */

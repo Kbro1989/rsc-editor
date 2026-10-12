@@ -58,6 +58,7 @@ export interface MeshResult {
   signature: string;
   terrain: GeometryData;
   walls: GeometryData;
+  hiddenWalls: GeometryData;
   roofs: GeometryData;
   scenery: MeshSceneryBatch[];
   sceneryTriangles: number;
@@ -146,6 +147,7 @@ export function runMeshJob(job: MeshJob, ctx: MeshContext): MeshResult {
     signature: job.signature,
     terrain: mesh.terrain,
     walls: mesh.walls,
+    hiddenWalls: mesh.hiddenWalls,
     roofs: mesh.roofs,
     scenery,
     sceneryTriangles: mesh.scenery.triangleCount,
@@ -203,8 +205,8 @@ export function transferables(result: MeshResult): ArrayBuffer[] {
   const out = new Set<ArrayBuffer>();
   const add = (g: GeometryData | undefined) => {
     if (!g) return;
-    for (const a of [g.positions, g.colours, g.uvs, g.normals, g.indices, g.triangleTextures, g.triangleTiles]) {
-      if (a.buffer instanceof ArrayBuffer) out.add(a.buffer);
+    for (const a of [g.positions, g.colours, g.plainColours, g.uvs, g.normals, g.indices, g.triangleTextures, g.triangleTiles]) {
+      if (a && a.buffer instanceof ArrayBuffer) out.add(a.buffer);
     }
   };
   add(result.terrain);

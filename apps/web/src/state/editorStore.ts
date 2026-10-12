@@ -25,6 +25,8 @@ import { create } from 'zustand';
 import { invert, sectorKey } from '@rsc-editor/schema';
 import type {
   DefinitionKind,
+  DefinitionOp,
+  EntityData,
   Lock,
   Op,
   Presence,
@@ -44,7 +46,8 @@ import { resetEntitySpriteCache } from '../data/useCacheAssets.js';
 import { resetLiveMapCache } from '../data/live-map.js';
 import { applySectorOp, describeOp, opId, opTileCount } from '../ops/apply.js';
 import { isApiHttpError } from '../data/http.js';
-import type { BuildResult, RegionClipboard, RegionRect } from '../ops/builders.js';
+import type { RegionClipboard, RegionRect } from '../ops/builders.js';
+import { applyEntityOp, type EntityIndex, type OpResult } from '../ops/entities.js';
 import type { WorldTile } from '../ops/coords.js';
 import {
   DEFAULT_TOOL_SETTINGS,
@@ -158,6 +161,16 @@ export interface EditorState {
   config: RscConfig | null;
   sectors: Record<string, LoadedSector>;
   loading: Record<string, true>;
+  /** NPC spawns, items and doors, by sector key then entity id */
+  entities: EntityIndex;
+  /**
+   * Bumped whenever the asset library (or a table it previews) changes, by
+   * anyone. The library screen and the scene's model/texture/sprite assets
+   * refetch when it moves.
+   */
+  libraryVersion: number;
+  /** the entity the inspector is editing */
+  selectedEntity: { sector: SectorCoord; id: string } | null;
 
   activeSector: SectorCoord | null;
   hoverTile: WorldTile | null;
@@ -200,6 +213,7 @@ export interface EditorState {
   readSector: (coord: SectorCoord) => SectorBuffers | undefined;
 
   setActiveSector(coord: SectorCoord | null): void;
+  selectEntity(ref: { sector: SectorCoord; id: string } | null): void;
   setHoverTile(tile: WorldTile | null): void;
   setViewCentre(view: ViewCentre | null): void;
   setSelection(rect: RegionRect | null): void;
@@ -215,7 +229,7 @@ export interface EditorState {
   startStroke(): void;
   /** the open drag, or null outside one */
   stroke: string | null;
-  commit(result: BuildResult, label?: string): void;
+  commit(result: OpResult, label?: string): void;
   commitDefinitionEdit(
     kind: DefinitionKind,
     index: number,
@@ -277,6 +291,21 @@ function applyDefinitionFields(
   return { ...config, [kind]: nextList } as RscConfig;
 }
 
+/** A definition op against the local config: update, append or drop the last row. */
+function applyDefinitionOp(config: RscConfig, op: DefinitionOp): RscConfig {
+  const kind = op.defKind as DefinitionKind;
+  if (op.kind === 'definition.update') return applyDefinitionFields(config, kind, op.index, op.to);
+  const lists = config as unknown as Record<string, Array<Record<string, unknown>>>;
+  const list = lists[kind];
+  if (!list) return config;
+  if (op.kind === 'definition.add') {
+    if (op.index !== list.length) return config;
+    return { ...config, [kind]: [...list, { ...op.to }] } as RscConfig;
+  }
+  if (op.index !== list.length - 1) return config;
+  return { ...config, [kind]: list.slice(0, -1) } as RscConfig;
+}
+
 /* --------------------------------------------------------------- store -- */
 
 export const useEditor = create<EditorState>()((set, get) => ({
@@ -294,6 +323,9 @@ export const useEditor = create<EditorState>()((set, get) => ({
   config: null,
   sectors: {},
   loading: {},
+  entities: {},
+  selectedEntity: null,
+  libraryVersion: 0,
 
   activeSector: null,
   hoverTile: null,
@@ -458,6 +490,8 @@ export const useEditor = create<EditorState>()((set, get) => ({
       world: null,
       config: null,
       sectors: {},
+      entities: {},
+      selectedEntity: null,
       activeSector: null
     });
   },
@@ -475,6 +509,8 @@ export const useEditor = create<EditorState>()((set, get) => ({
       world: null,
       config: null,
       sectors: {},
+      entities: {},
+      selectedEntity: null,
       locks: {},
       activeSector: null,
       viewCentre: null
@@ -502,6 +538,8 @@ export const useEditor = create<EditorState>()((set, get) => ({
       world: null,
       config: null,
       sectors: {},
+      entities: {},
+      selectedEntity: null,
       locks: {},
       peers: {},
       activeSector: null,
@@ -584,6 +622,10 @@ export const useEditor = create<EditorState>()((set, get) => ({
   },
 
   /* ------------------------------------------------------------ selection -- */
+
+  selectEntity(ref) {
+    set({ selectedEntity: ref });
+  },
 
   setActiveSector(coord) {
     set({ activeSector: coord });
@@ -868,7 +910,7 @@ function lockBlocked(state: EditorState, tx: Transaction): SectorCoord[] {
   const out: SectorCoord[] = [];
   const seen = new Set<string>();
   for (const op of tx.ops) {
-    if (op.type !== 'sector') continue;
+    if (op.type === 'definition' || op.type === 'asset') continue;
     const key = sectorKey(op.sector);
     if (seen.has(key)) continue;
     seen.add(key);
@@ -935,6 +977,8 @@ function applyLocally(set: Setter, get: Getter, ops: Op[]): void {
   const sectors = { ...state.sectors };
   let config = state.config;
   let touchedSectors = false;
+  let entities: EntityIndex | null = null;
+  let library = false;
 
   for (const op of ops) {
     localOpIds.add(op.id);
@@ -948,14 +992,33 @@ function applyLocally(set: Setter, get: Getter, ops: Op[]): void {
       // typed arrays themselves are reused (the mesher reads them by view).
       sectors[key] = { ...loaded, rev: loaded.rev + 1 };
       touchedSectors = true;
+    } else if (op.type === 'entity') {
+      entities ??= { ...state.entities };
+      applyEntityOp(entities, op);
+    } else if (op.type === 'asset') {
+      library = true;
     } else if (config) {
-      config = applyDefinitionFields(config, op.defKind as DefinitionKind, op.index, op.to);
+      config = applyDefinitionOp(config, op);
+      // Texture and animation tables feed the previews the server rebuilds.
+      if (op.defKind === 'textures' || op.defKind === 'animations') library = true;
     }
   }
 
   const patch: Partial<EditorState> = {};
   if (touchedSectors) patch.sectors = sectors;
+  if (entities) {
+    patch.entities = entities;
+    // A removed entity cannot stay selected.
+    const sel = state.selectedEntity;
+    if (sel && !entities[sectorKey(sel.sector)]?.[sel.id]) patch.selectedEntity = null;
+  }
   if (config !== state.config) patch.config = config;
+  if (library) {
+    patch.libraryVersion = state.libraryVersion + 1;
+    // The previews were rebuilt before this op was broadcast; refetch them.
+    state.api.invalidateLibraryAssets();
+    resetEntitySpriteCache();
+  }
   if (Object.keys(patch).length > 0) set(patch);
 }
 
@@ -1009,6 +1072,16 @@ function handleServerMessage(message: ServerMessage): void {
       // Someone else's edit: apply it to our mirror but never to our undo stack
       // (undo is scoped to your own ops -- PLAN.md).
       applyLocally(store.setState, store.getState, remote.map((s) => s.op));
+      break;
+    }
+
+    case 'sector.entities': {
+      // The server's list for a sector it just (re)sent: the whole truth for it.
+      const inSector: Record<string, EntityData> = {};
+      for (const e of message.entities) inSector[e.id] = e.data;
+      store.setState((s) => ({
+        entities: { ...s.entities, [sectorKey(message.sector)]: inSector }
+      }));
       break;
     }
 

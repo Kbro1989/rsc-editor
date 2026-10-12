@@ -6,14 +6,23 @@
  * and `src/state/gesture.ts` turns (tool + settings + tile) into ops.
  */
 
+import { useMemo } from 'react';
 import { clampLane } from '../ops/apply.js';
-import { BRUSH_SHAPES, ELEVATION_MODES, FALLOFFS, WALL_EDGES, WALL_EDGE_LABELS } from '../ops/builders.js';
+import {
+  BRUSH_SHAPES,
+  ELEVATION_MODES,
+  FALLOFFS,
+  WALL_EDGES,
+  WALL_EDGE_LABELS,
+  holeOverlays
+} from '../ops/builders.js';
 import { TOOLS, type ToolId } from '../tools/registry.js';
+import { groupCounts, pickGroup, type GroupCounts } from '../ops/group.js';
 import { useEditor } from '../state/editorStore.js';
 import { copySelection, repairHeldScenery } from '../state/gesture.js';
 import { TERRAIN_PALETTE, terrainBand, terrainColour } from '../data/terrain-palette.js';
 import { NumberField, Readout, Section, Segmented, Slider, Toggle } from './controls.js';
-import { DefPicker } from './DefPicker.js';
+import { DefPicker, WalkTag } from './DefPicker.js';
 import { SectorBrowser } from './SectorBrowser.js';
 
 export function ToolPalette() {
@@ -77,7 +86,167 @@ function ToolOptions({ tool }: { tool: ToolId }) {
       return <SceneryOptions />;
     case 'region':
       return <RegionOptions />;
+    case 'npc':
+      return <NpcOptions />;
+    case 'item':
+      return <ItemOptions />;
+    case 'hole':
+      return <HoleOptions />;
+    case 'eraser':
+      return <EraserOptions />;
+    case 'group':
+      return <GroupOptions />;
   }
+}
+
+const GROUP_LABELS: Array<[keyof GroupCounts, string]> = [
+  ['scenery', 'Scenery (whole objects)'],
+  ['walls', 'Walls'],
+  ['roofs', 'Roofs'],
+  ['npcs', 'NPCs'],
+  ['items', 'Ground items'],
+  ['doors', 'Doors']
+];
+
+function GroupOptions() {
+  const s = useEditor((st) => st.toolSettings.group);
+  const update = useEditor((st) => st.updateToolSettings);
+  const selection = useEditor((st) => st.selection);
+  const sectors = useEditor((st) => st.sectors);
+  const entities = useEditor((st) => st.entities);
+  const objects = useEditor((st) => st.config?.objects);
+
+  // What the selection holds, with everything ticked so the count shows what
+  // un-ticking would leave behind.
+  const counts = useMemo(() => {
+    if (!selection || !objects) return null;
+    const all = { walls: true, scenery: true, roofs: true, npcs: true, items: true, doors: true };
+    const picked = pickGroup(selection, all, useEditor.getState().readSector, objects, entities);
+    return picked.missing.length > 0 ? null : groupCounts(picked.group);
+  }, [selection, objects, entities, sectors]);
+
+  const w = selection ? Math.abs(selection.x1 - selection.x0) + 1 : 0;
+  const h = selection ? Math.abs(selection.y1 - selection.y0) + 1 : 0;
+
+  return (
+    <Section title="Group">
+      <Segmented
+        label="Mode"
+        value={s.mode}
+        options={['select', 'move', 'copy']}
+        onChange={(mode) => update('group', { mode })}
+      />
+      <Readout label="Selection" value={selection ? `${w} x ${h} tiles` : 'none — drag a rectangle'} />
+      {GROUP_LABELS.map(([part, label]) => (
+        <Toggle
+          key={part}
+          label={counts ? `${label} (${counts[part]})` : label}
+          checked={s[part]}
+          onChange={(on) => update('group', { [part]: on })}
+        />
+      ))}
+      <div className="field__row">
+        <button
+          type="button"
+          className="btn btn--sm"
+          disabled={!selection}
+          onClick={() => useEditor.getState().setSelection(null)}
+        >
+          Clear selection
+        </button>
+      </div>
+      <p className="hint">
+        <b>Select</b>: drag a rectangle. An object is taken whole if the rectangle touches any
+        part of it; NPCs take their wander box with them. Terrain height, colour and overlay
+        stay where they are.
+        <br />
+        <b>Move</b> / <b>Copy</b>: the orange outline is where the group lands; click to drop it.
+        A move takes it away from where it was and goes back to Select; Copy stays on so you can
+        stamp more. A drop that would put an object on another object is refused whole. One undo
+        per drop. You need to hold every sector it touches, source and destination.
+      </p>
+    </Section>
+  );
+}
+
+function HoleOptions() {
+  const s = useEditor((st) => st.toolSettings.hole);
+  const update = useEditor((st) => st.updateToolSettings);
+  const tiles = useEditor((st) => st.config?.tiles);
+  const holes = tiles ? holeOverlays(tiles) : [];
+
+  return (
+    <Section title="Holes">
+      <div className="list" role="radiogroup" aria-label="Hole type">
+        {holes.map((overlay) => {
+          const see = tiles![overlay - 1]!.colour === 'transparent';
+          return (
+            <button
+              key={overlay}
+              type="button"
+              className="row"
+              aria-selected={s.overlay === overlay}
+              onClick={() => update('hole', { overlay })}
+            >
+              <span className="row__idx">{overlay}</span>
+              <span
+                className="swatch"
+                style={see ? { background: 'transparent', borderStyle: 'dashed' } : { background: tiles![overlay - 1]!.colour ?? '#000' }}
+              />
+              <span className="row__name">{see ? 'see-through' : 'black void'}</span>
+            </button>
+          );
+        })}
+      </div>
+      <Segmented label="Shape" value={s.shape} options={BRUSH_SHAPES} onChange={(shape) => update('hole', { shape })} />
+      <Slider
+        label="Radius"
+        value={s.radius}
+        min={0}
+        max={12}
+        suffix=" tiles"
+        onChange={(radius) => update('hole', { radius })}
+      />
+      <p className="hint">
+        A hole is an overlay the game treats as nothing to stand on: it blocks movement. A
+        see-through one draws no ground at all, so on an upper floor you look down through it;
+        a black one is the void at the edge of a dungeon. Hold <span className="kbd">Alt</span>{' '}
+        to fill holes back in — only holes, never the paths or floors beside them.
+      </p>
+    </Section>
+  );
+}
+
+function EraserOptions() {
+  const s = useEditor((st) => st.toolSettings.eraser);
+  const update = useEditor((st) => st.updateToolSettings);
+
+  return (
+    <Section title="Eraser">
+      <Segmented label="Shape" value={s.shape} options={BRUSH_SHAPES} onChange={(shape) => update('eraser', { shape })} />
+      <Slider
+        label="Radius"
+        value={s.radius}
+        min={0}
+        max={12}
+        suffix=" tiles"
+        onChange={(radius) => update('eraser', { radius })}
+      />
+      <Toggle label="Scenery (whole objects)" checked={s.scenery} onChange={(scenery) => update('eraser', { scenery })} />
+      <Toggle label="NPCs" checked={s.npcs} onChange={(npcs) => update('eraser', { npcs })} />
+      <Toggle label="Ground items" checked={s.items} onChange={(items) => update('eraser', { items })} />
+      <Toggle label="Doors" checked={s.doors} onChange={(doors) => update('eraser', { doors })} />
+      <Toggle label="Walls" checked={s.walls} onChange={(walls) => update('eraser', { walls })} />
+      <Toggle label="Overlay paint and holes" checked={s.overlay} onChange={(overlay) => update('eraser', { overlay })} />
+      <Toggle label="Roofs" checked={s.roofs} onChange={(roofs) => update('eraser', { roofs })} />
+      <p className="hint">
+        Clears what is ticked on every tile under the brush; drag to sweep. An object is removed
+        whole if the brush touches any part of it. Terrain height and colour are never touched.
+        Roofs are off by default: you cannot see one from inside a building, so it is easy to
+        erase by accident. One undo takes back the whole stroke.
+      </p>
+    </Section>
+  );
 }
 
 function ElevationOptions() {
@@ -234,12 +403,19 @@ function PaintOptions() {
                   {t.colour === 'transparent' ? ' — transparent (hole)' : ''}
                 </span>
                 {typeof t.texture === 'number' && <span className="row__tag">tex {t.texture}</span>}
+                <WalkTag kind="tiles" entry={t as unknown as Record<string, unknown>} />
               </button>
             ))}
           </div>
+          {tiles?.[s.overlayIndex - 1]?.blocked && (
+            <p className="hint hint--warn">
+              Overlay {s.overlayIndex} is <b>blocked</b>: players cannot walk on it. That is right for
+              water or rock, not for a path.
+            </p>
+          )}
           <p className="hint">
-            Overlay 7 is the &quot;hole&quot; tile — its colour is literally{' '}
-            <code>transparent</code>, which is geometry, not a missing value.
+            Overlays 8 and 10 are holes (see-through and black); the Holes tool paints them,
+            and fills in only holes when you hold <span className="kbd">Alt</span>.
           </p>
         </Section>
       )}
@@ -259,6 +435,22 @@ function WallOptions() {
         onChange={(edge) => update('wall', { edge })}
       />
       <Toggle label="Erase mode" checked={s.erase} onChange={(erase) => update('wall', { erase })} />
+      <Toggle
+        label="Server door (spawned by the game server)"
+        checked={s.door}
+        onChange={(door) => update('wall', { door })}
+      />
+      {s.door && (
+        <p className="hint">
+          Places a door entity on the edge instead of writing the map, and the game server
+          writes it into the map itself at startup — so leave that edge <em>empty</em>, or the
+          map wall stays there and blocks the doorway whether the door is open or not.
+          Use wall object <strong>#2 (Door)</strong> on a horizontal or vertical edge: that is
+          the one rsc-server's generic door script opens (swapping it for #1, Doorframe). Any
+          other id is just a wall that never opens. Clicking an existing door selects it;{' '}
+          <span className="kbd">Alt</span> removes it.
+        </p>
+      )}
       <DefPicker
         kind="wallObjects"
         label="Wall object"
@@ -350,6 +542,13 @@ function SceneryOptions() {
         preview
         onChange={(objectId) => update('scenery', { objectId })}
       />
+      {selected?.type === 'closed-door' && (
+        <p className="hint hint--warn">
+          A <b>closed</b> door or gate: players cannot walk through it until they open it in game, and
+          that needs a server script for this object (the stock gates and doors have one). Pick its
+          open version to place it already open.
+        </p>
+      )}
       {selected && (
         <Readout
           label="Footprint"
@@ -481,6 +680,69 @@ function OverlayToggles() {
         checked={showLockTint}
         onChange={() => toggle('showLockTint')}
       />
+    </Section>
+  );
+}
+
+function NpcOptions() {
+  const s = useEditor((st) => st.toolSettings.npc);
+  const update = useEditor((st) => st.updateToolSettings);
+  return (
+    <Section title="NPCs">
+      <Segmented
+        label="Mode"
+        value={s.mode}
+        options={['place', 'remove']}
+        onChange={(mode) => update('npc', { mode })}
+      />
+      <DefPicker kind="npcs" label="NPC" value={s.npcId} onChange={(npcId) => update('npc', { npcId })} />
+      <Slider
+        label="Wander radius"
+        value={s.wanderRadius}
+        min={0}
+        max={32}
+        suffix=" tiles"
+        onChange={(wanderRadius) => update('npc', { wanderRadius })}
+      />
+      <p className="hint">
+        Click to place a spawn. Clicking an existing one selects it, so its wander box can be
+        edited in the inspector; <span className="kbd">Shift</span> places another on the same
+        tile, <span className="kbd">Alt</span> removes. Spawns are the game server&apos;s, exported
+        as <code>npcs.json</code>.
+      </p>
+    </Section>
+  );
+}
+
+function ItemOptions() {
+  const s = useEditor((st) => st.toolSettings.item);
+  const update = useEditor((st) => st.updateToolSettings);
+  return (
+    <Section title="Ground items">
+      <Segmented
+        label="Mode"
+        value={s.mode}
+        options={['place', 'remove']}
+        onChange={(mode) => update('item', { mode })}
+      />
+      <DefPicker kind="items" label="Item" value={s.itemId} onChange={(itemId) => update('item', { itemId })} />
+      <NumberField
+        label="Amount"
+        value={s.amount}
+        min={1}
+        onChange={(amount) => update('item', { amount: Math.max(1, amount) })}
+      />
+      <NumberField
+        label="Respawn (seconds)"
+        value={s.respawnSeconds}
+        min={0}
+        onChange={(respawnSeconds) => update('item', { respawnSeconds: Math.max(0, respawnSeconds) })}
+      />
+      <p className="hint">
+        Click to place; clicking an existing item selects it, <span className="kbd">Shift</span>{' '}
+        stacks another, <span className="kbd">Alt</span> removes. Exported as{' '}
+        <code>items.json</code>.
+      </p>
     </Section>
   );
 }

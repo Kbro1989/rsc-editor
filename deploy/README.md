@@ -80,7 +80,10 @@ bash /opt/rsc-editor/deploy/import.sh \
 ```
 
 `--scenery` is optional (the placement list is not part of the cache; see
-`docs/DECISIONS.md` §12). `bash deploy/import.sh --help` lists the rest.
+`docs/DECISIONS.md` §12). So is `--spawns <dir>`, which places the game
+server's NPCs, ground items and doors from an rsc-data `locations/` directory
+(§19); with it, an export also carries `npcs.json`, `items.json` and
+`wall-objects.json`. `bash deploy/import.sh --help` lists the rest.
 Admins see every project, so no `--owner` is needed.
 
 ## 5. Let people in
@@ -101,6 +104,109 @@ project list):
 
 `DISCORD_GUILD_ID` still works on top of this if you also want to require
 membership of your Discord server.
+
+## 6. The game server (optional)
+
+Runs the game — rsc-server, its data server and the rsc-client web client,
+kept together in [iraqnroll/rsc-game](https://github.com/iraqnroll/rsc-game) —
+in the same container, and turns on the editor's **Publish** button.
+
+```sh
+cd /root/rsc-editor && bash deploy/game/install.sh --game-url https://game.example.com
+```
+
+**Deploying game code** is the same command again: it fetches the branch it
+follows (`main`), reinstalls, rebuilds the client, puts the last published
+cache back and restarts. `--repo <url>` and `--ref <branch|commit>` choose
+something else and are remembered in `/etc/rsc-game/source`.
+
+Then point your front proxy at this container's port **8081** for the game's
+domain (it must pass WebSockets; Caddy does by default). Over https the
+client's socket goes to `wss://<game domain>/ws`, which the container's Caddy
+hands to rsc-server. `RSC_GAME_ADDRESS` in `/etc/default/caddy` works like
+`RSC_SITE_ADDRESS`.
+
+**Publish** (admins only, top bar) builds exactly what Export would, and the
+game restarts with it — everyone playing is disconnected. How it gets there:
+
+1. the editor writes `/var/lib/rsc-game/inbox/cache.zip`, then `request.json`;
+2. `rsc-game-publish.path` sees the request and starts
+   `rsc-game-publish.service`, which runs `deploy/game/publish.sh` as root;
+3. that installs the cache with `deploy/game/load-cache.sh`, restarts
+   `rsc-game`, waits for it to listen, and writes
+   `/var/lib/rsc-game/status.json`, which the button shows.
+
+The editor itself only ever writes to the inbox. If the game does not come
+back up with the new cache, the previous one is put back and the button
+reports the failure.
+
+**Worlds** (admins, top bar) shows each world: up or down, players online,
+uptime and memory, and who is on (rank, level, position, address, time
+online). From there you can broadcast a message, kick a player (saved first),
+and restart with an in-game countdown — the world saves everyone at zero and
+systemd starts it again. The editor reaches each world through its control
+socket (`/run/rsc-game/world-1.sock`, listed in `/etc/rsc-game/worlds.json`);
+the editor's user is in the `rscgame` group, which is all that socket allows.
+
+A publish now warns players too: with anyone online, they get a 30-second
+countdown (`PUBLISH_COUNTDOWN` in `rsc-game-publish.service`), then the
+restart logs everyone out, which saves them. Any `systemctl stop` or
+`restart` of the game saves players the same way.
+
+Players' real addresses reach the game (`X-Real-IP`, trusted only from this
+container's Caddy), so the data server's one-login-per-address rule counts
+people, not the proxy. The main Caddyfile trusts private-range proxies to
+say who the client is; narrow `trusted_proxies` to your front proxy if the
+LAN is not yours. Raise `playersPerIP` in `/etc/rsc-game/data-server.json`
+if several people share one address.
+
+**Events** (a tab in Worlds) is what happened in the game: logins and
+logouts with addresses, chat, private messages, drops, pickups (with whose
+item it was), deaths, `::` commands tried, and admin actions. Search by
+player — clicking a name gives that player's timeline, as either party — by
+type, text and date. Each world writes events to
+`/var/lib/rsc-game-events/world-1.jsonl` first and forgets them only once the
+editor has stored them, so an editor restart loses nothing. They are kept for
+`GAME_EVENT_RETENTION` (chat and PMs 90 days, drops and pickups 30, the rest
+a year, by default), then deleted. Trades are not logged: trading is a stub
+in rsc-server (`model/trade.js`) and never completes.
+
+**Admin log** (the other tab) is every admin action outside the map — world
+actions, publishes, Access changes — with who, what, whom, and whether it
+worked, including attempts by people who were not allowed. It is
+append-only in the database itself and kept for good.
+
+**Player page**: click a player's name — in the online list, or "open player
+page" on an Events timeline — for their account (created, last login and
+from where, whether they are on, mutes and bans, skills, recent events) and
+four actions, each needing a reason that goes in the Admin log:
+
+- **Mute** for 1 hour, 1 day, 7 days, 30 days or for good; **Unmute**.
+- **Ban** for the same; a player who is on is kicked at once. **Unban**.
+- **Rank**: player, moderator (2) or administrator (3). Applies at once,
+  online or not — the easy way to make your own account an admin.
+- **Reset password**: a new one is shown once, to you, and not stored
+  anywhere else — not in the Admin log, not in any log.
+
+Staff ranks can also be set with the data server's script while the player is
+logged out:
+
+```sh
+cd /opt/rsc-game/rsc-data-server && sudo -u rscgame node src/set-rank.js <username> 3 /etc/rsc-game/data-server.json
+```
+
+In game, `::help` lists what your rank can use.
+
+Tested in a systemd Debian 12 container: the install, a publish from the
+editor's button through to the game listening on the new cache, a corrupt
+cache rolled back with the game left running, and the WebSocket handshake
+through `/ws`. A player logging in over https has not been tried.
+
+Accounts are in `/var/lib/rsc-game-accounts` and survive a reinstall. The last
+published cache is kept as `/var/lib/rsc-game/current.zip` and reinstalled by
+every deploy. `load-cache.sh --restore` (with `GAME_DIR=/opt/rsc-game
+STOCK_DIR=/var/lib/rsc-game/stock`) returns the game to the cache the
+repository ships.
 
 ## Updating
 
@@ -137,3 +243,6 @@ systemctl start rsc-editor
 | config | `/etc/rsc-editor/server.env`, `/etc/default/caddy` |
 | code and build | `/opt/rsc-editor` (replaced by every update) |
 | backups | `/var/backups/rsc-editor` |
+| game log | `journalctl -u rsc-game -f`, `journalctl -u rsc-game-data -f`, or Worlds -> Server logs in the editor |
+| last publish | `journalctl -u rsc-game-publish`, `/var/lib/rsc-game/status.json`, `/var/lib/rsc-game/work/log` |
+| game config | `/etc/rsc-game/server.json`, `/etc/rsc-game/data-server.json`, `/etc/rsc-game/worlds.json` |

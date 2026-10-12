@@ -22,6 +22,27 @@
       "when": 1789557957673,
       "tag": "0002_access_allowlist",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1789644227764,
+      "tag": "0003_entities",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1789653243158,
+      "tag": "0004_asset_library",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1789740273909,
+      "tag": "0005_audit",
+      "breakpoints": true
     }
   ]
 }

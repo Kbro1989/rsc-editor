@@ -60,6 +60,11 @@ export interface ViewportProps {
   onPick: (tile: WorldTile, mods: { alt: boolean; shift: boolean; continued: boolean }) => void;
   onHover: (tile: WorldTile | null) => void;
   onDragRegion: (rect: RegionRect | null) => void;
+  /**
+   * The Group tool's drop preview: while set, the cursor is drawn as this
+   * rectangle (relative to the hovered tile) instead of the brush.
+   */
+  ghost?: ((hover: WorldTile) => RegionRect) | null;
 
   /* ------------------------------------------------------------ additions -- */
 
@@ -73,4 +78,32 @@ export interface ViewportProps {
    * rather than inventing fills.
    */
   config?: RscConfig | null;
+
+  /**
+   * NPC spawns, ground items and server doors to mark, in world tiles.
+   * ADDED for entity placement; optional like the rest.
+   */
+  entities?: ViewportEntity[];
+
+  /** Bumped when the asset library changes; the scene reloads its textures and models. */
+  libraryVersion?: number;
+}
+
+export interface ViewportEntity {
+  id: string;
+  kind: 'npc' | 'item' | 'door';
+  plane: number;
+  wx: number;
+  wy: number;
+  /** doors: 0 horizontal, 1 vertical, 2 "/", 3 "\" */
+  direction?: number;
+  /** doors: the wall object's height, in render units */
+  height?: number;
+  selected: boolean;
+  /** NPCs: the definition index, for the picture */
+  npcId?: number;
+  /** items: the definition index, for the picture */
+  itemId?: number;
+  /** NPCs: the wander box in world tiles, inclusive */
+  wander?: RegionRect;
 }

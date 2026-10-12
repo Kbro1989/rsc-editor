@@ -8,10 +8,13 @@
  * behaviour is identical and lives here.
  */
 
-import { parseSectorKey } from '@rsc-editor/schema';
-import type { Lane } from '@rsc-editor/schema';
+import { parseSectorKey, sectorKey } from '@rsc-editor/schema';
+import type { Lane, SectorCoord } from '@rsc-editor/schema';
 import {
+  brushWorldTiles,
   buildElevationOp,
+  buildEraseOp,
+  buildHoleOp,
   buildPaintOp,
   buildRegionFillOp,
   buildRegionPasteOp,
@@ -22,10 +25,21 @@ import {
   buildSceneryRotateOp,
   buildWallOp,
   copyRegion,
+  holeOverlays,
   normaliseRect,
   type BuildResult
 } from '../ops/builders.js';
 import type { WorldTile } from '../ops/coords.js';
+import {
+  DOOR_DIRECTION_BY_EDGE,
+  buildEntityAdd,
+  buildEntityRemove,
+  entitiesAt,
+  wanderAround,
+  type OpResult
+} from '../ops/entities.js';
+import type { EntityKind } from '@rsc-editor/schema';
+import { buildGroupDrop, groupTarget, isEmptyGroup, pickGroup } from '../ops/group.js';
 import { useEditor } from './editorStore.js';
 
 export interface GestureModifiers {
@@ -40,14 +54,20 @@ export function applyGesture(tile: WorldTile, mods: GestureModifiers): void {
   if (!mods.continued) useEditor.getState().startStroke();
   const state = useEditor.getState();
   const read = state.readSector;
+  const loaded = (coord: SectorCoord) => read(coord) !== undefined;
   const s = state.toolSettings;
 
   switch (state.activeTool) {
     case 'select': {
-      // Read-only: selecting a tile selects its sector.
+      // Read-only: selecting a tile selects its sector, and whatever NPC, item
+      // or door stands on it (or nothing, which clears the selection).
       const sx = Math.floor(tile.wx / 48);
       const sy = Math.floor(tile.wy / 48);
       state.setActiveSector({ plane: tile.plane, x: sx, y: sy });
+      if (!mods.continued) {
+        const first = entitiesAt(state.entities, tile)[0];
+        state.selectEntity(first ? { sector: first.sector, id: first.id } : null);
+      }
       return;
     }
 
@@ -81,7 +101,69 @@ export function applyGesture(tile: WorldTile, mods: GestureModifiers): void {
 
     case 'wall': {
       const erase = s.wall.erase || mods.alt;
-      state.commit(buildWallOp(tile, s.wall.edge, erase ? 0 : s.wall.wallId, read));
+      if (s.wall.door) {
+        // Server doors: one per edge. Dragging would stack a door on every
+        // tile crossed, which is almost never meant, so a door is a click.
+        if (mods.continued) return;
+        const direction = DOOR_DIRECTION_BY_EDGE[s.wall.edge];
+        const here = entitiesAt(state.entities, tile, 'door').filter(
+          (e) => e.data.kind === 'door' && e.data.direction === direction
+        );
+        if (erase) {
+          state.commit(buildEntityRemove(here), 'Remove door');
+        } else if (here.length > 0) {
+          state.selectEntity({ sector: here[0]!.sector, id: here[0]!.id });
+        } else {
+          state.commit(
+            buildEntityAdd(tile, (i) => ({ kind: 'door', i, wallId: s.wall.wallId, direction }), loaded),
+            'Place door'
+          );
+        }
+        return;
+      }
+      state.commit(buildWallOp(tile, s.wall.edge, erase ? null : s.wall.wallId, read));
+      return;
+    }
+
+    case 'npc':
+    case 'item': {
+      if (mods.continued) return;
+      const kind = state.activeTool === 'npc' ? 'npc' : 'item';
+      const here = entitiesAt(state.entities, tile, kind);
+      const remove = mods.alt || s[state.activeTool].mode === 'remove';
+      if (remove) {
+        state.commit(buildEntityRemove(here), kind === 'npc' ? 'Remove NPC' : 'Remove item');
+        return;
+      }
+      // Clicking an existing one selects it for the inspector; shift places
+      // another on the same tile (the shipped lists do stack items).
+      if (here.length > 0 && !mods.shift) {
+        state.selectEntity({ sector: here[0]!.sector, id: here[0]!.id });
+        return;
+      }
+      if (kind === 'npc') {
+        const wander = wanderAround(tile, s.npc.wanderRadius);
+        if (!wander) return;
+        state.commit(
+          buildEntityAdd(tile, (i) => ({ kind: 'npc', i, npcId: s.npc.npcId, wander }), loaded),
+          'Place NPC'
+        );
+      } else {
+        state.commit(
+          buildEntityAdd(
+            tile,
+            (i) => ({
+              kind: 'item',
+              i,
+              itemId: s.item.itemId,
+              amount: Math.max(1, Math.floor(s.item.amount)),
+              respawnMs: Math.max(0, Math.round(s.item.respawnSeconds * 1000))
+            }),
+            loaded
+          ),
+          'Place item'
+        );
+      }
       return;
     }
 
@@ -94,6 +176,9 @@ export function applyGesture(tile: WorldTile, mods: GestureModifiers): void {
     }
 
     case 'scenery': {
+      // One object per click. Dragging would place a row of them, or spin the
+      // one under the cursor once per tile crossed.
+      if (mods.continued) return;
       const mode = mods.alt ? 'remove' : s.scenery.mode;
       const objects = state.config?.objects;
       if (!objects) {
@@ -106,6 +191,107 @@ export function applyGesture(tile: WorldTile, mods: GestureModifiers): void {
         state.commit(buildSceneryRotateOp(tile, mods.shift ? 7 : 1, read, objects));
       } else {
         state.commit(buildSceneryRemoveOp(tile, read, objects));
+      }
+      return;
+    }
+
+    case 'hole': {
+      const tiles = state.config?.tiles;
+      if (!tiles) {
+        state.setNotice({ kind: 'info', message: 'Definitions are still loading.' });
+        return;
+      }
+      const holes = holeOverlays(tiles);
+      if (!mods.alt && !holes.includes(s.hole.overlay)) {
+        state.setNotice({
+          kind: 'info',
+          message: holes.length === 0
+            ? 'This project defines no hole tiles (a tile definition with type "hole").'
+            : `Overlay ${s.hole.overlay} is not a hole in this project; pick one in the Holes panel.`
+        });
+        return;
+      }
+      state.commit(
+        buildHoleOp(
+          tile,
+          { radius: s.hole.radius, shape: s.hole.shape, overlay: mods.alt ? null : s.hole.overlay },
+          holes,
+          read
+        ),
+        mods.alt ? 'Fill holes' : 'Make holes'
+      );
+      return;
+    }
+
+    case 'eraser': {
+      const e = s.eraser;
+      const objects = state.config?.objects;
+      if (e.scenery && !objects) {
+        state.setNotice({ kind: 'info', message: 'Definitions are still loading.' });
+        return;
+      }
+      const lanes = buildEraseOp(tile, e, read, objects ?? []);
+      // Entities live beside the lanes, one per tile index, so the brush picks
+      // them up tile by tile. A door belongs to the tile whose edge it is on.
+      const kinds = new Set<EntityKind>();
+      if (e.npcs) kinds.add('npc');
+      if (e.items) kinds.add('item');
+      if (e.doors) kinds.add('door');
+      const refs = kinds.size === 0
+        ? []
+        : brushWorldTiles(tile, e.radius, e.shape).flatMap((t) =>
+            entitiesAt(state.entities, t).filter((r) => kinds.has(r.data.kind))
+          );
+      const entities = buildEntityRemove(refs);
+      const merged: OpResult = {
+        ops: [...lanes.ops, ...entities.ops],
+        missing: lanes.missing,
+        touched: [...lanes.touched, ...entities.touched],
+        conflicts: lanes.conflicts
+      };
+      state.commit(merged, 'Erase');
+      return;
+    }
+
+    case 'group': {
+      // Select is a drag, handled like the Region tool's. Move and copy are a
+      // click each: one drop per click, never a smear along a drag.
+      const g = s.group;
+      if (g.mode === 'select' || mods.continued) return;
+      const selection = state.selection;
+      if (!selection) {
+        state.setNotice({ kind: 'info', message: 'Drag a rectangle around what to move or copy first.' });
+        return;
+      }
+      const objects = state.config?.objects;
+      if (!objects) {
+        state.setNotice({ kind: 'info', message: 'Definitions are still loading.' });
+        return;
+      }
+      const picked = pickGroup(selection, g, read, objects, state.entities);
+      if (picked.missing.length > 0) {
+        state.commit({ ops: [], missing: picked.missing, touched: [], conflicts: [] });
+        return;
+      }
+      if (isEmptyGroup(picked.group)) {
+        state.setNotice({ kind: 'info', message: 'Nothing in the selection matches what is ticked.' });
+        return;
+      }
+      const target = groupTarget(tile, selection);
+      const result = buildGroupDrop(picked.group, target, g.mode === 'move', read, objects, loaded);
+      const mine = state.me?.userId;
+      const goesThrough =
+        result.conflicts.length === 0 &&
+        result.missing.length === 0 &&
+        result.ops.length > 0 &&
+        result.touched.every((c) => state.locks[sectorKey(c)]?.userId === mine);
+      state.commit(result, g.mode === 'move' ? 'Move group' : 'Copy group');
+      // The selection follows a move, and the tool goes back to selecting so
+      // the next click cannot move it again by accident. Copy stays armed, to
+      // stamp as many as you like.
+      if (goesThrough && g.mode === 'move') {
+        state.setSelection(target);
+        state.updateToolSettings('group', { mode: 'select' });
       }
       return;
     }

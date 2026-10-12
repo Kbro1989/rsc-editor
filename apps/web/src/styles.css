@@ -450,6 +450,8 @@ input[type="color"] {
   color: var(--fg-0);
   font: inherit;
   font-size: 11.5px;
+  /* the same look for a link styled as a button (Play) */
+  text-decoration: none;
   cursor: pointer;
   white-space: nowrap;
 }
@@ -1381,4 +1383,422 @@ input[type="color"] {
 }
 .access__actions {
   text-align: right;
+}
+
+/* Assets screen: the project's models, textures and sprites. */
+.modal.modal--assets {
+  width: min(1180px, calc(100vw - 32px));
+  height: calc(100vh - 64px);
+  max-height: none;
+  display: flex;
+  flex-direction: column;
+}
+/* The header, tabs and notice keep their height; only the body scrolls.
+   Without `flex: none` the tab bar (itself `overflow-x: auto`, so allowed to
+   shrink to nothing) collapsed to 0px under a tall grid. */
+.modal--assets > .panel__header,
+.modal--assets > .tabs,
+.modal--assets > .assets__notice {
+  flex: none;
+}
+.assets__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 12px 16px;
+}
+.assets__intro {
+  margin: 8px 0 0;
+}
+.assets__notice {
+  margin: 8px 12px 0;
+}
+.assets__heading {
+  margin: 14px 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-1);
+}
+.assets__bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 0;
+}
+.assets__inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  color: var(--fg-2);
+}
+.assets__bar input[type="search"],
+.assets__bar input[type="text"] {
+  width: 180px;
+}
+.assets__bar select {
+  width: auto;
+}
+.assets__inline input[type="number"] {
+  width: 64px;
+}
+.assets__table-wrap {
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+.assets__table td {
+  vertical-align: middle;
+}
+.assets__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+}
+.assets__grid--wide {
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+}
+.assets__grid--small {
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+}
+.asset {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 8px 6px;
+  background: var(--bg-2, var(--bg-1));
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  min-width: 0;
+}
+.asset__thumb {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background:
+    repeating-conic-gradient(#20242c 0% 25%, #171a20 0% 50%) 0 0 / 12px 12px;
+  border-radius: 3px;
+  flex: none;
+}
+.asset__thumb img {
+  image-rendering: pixelated;
+}
+.asset__thumb--missing {
+  outline: 1px dashed var(--danger);
+}
+.asset__crop {
+  display: block;
+  background-repeat: no-repeat;
+  background-position: 0 0;
+  image-rendering: pixelated;
+}
+.asset__name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+}
+.asset__meta,
+.asset__uses {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--fg-2);
+}
+.asset__uses--none {
+  color: var(--fg-3, var(--fg-2));
+  font-style: italic;
+}
+.asset__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 3px;
+  margin-top: 3px;
+}
+.assets__room {
+  margin: 0 0 6px;
+}
+
+/* ---- worlds ------------------------------------------------------------ */
+
+.worlds__list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 14px 10px;
+}
+.worlds__card {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 8px;
+  align-items: center;
+  min-width: 220px;
+  padding: 8px 10px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--fg-0);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.worlds__card[aria-selected='true'] {
+  border-color: var(--accent, #4c9aff);
+}
+.worlds__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.worlds__dot.is-up {
+  background: #3ecf6e;
+}
+.worlds__dot.is-down {
+  background: #e5484d;
+}
+.worlds__name {
+  font-weight: 600;
+}
+.worlds__meta {
+  grid-column: 2;
+  color: var(--fg-2, #8b93a1);
+  font-size: 11px;
+}
+.worlds__row,
+.worlds__pending {
+  padding: 0 14px 8px;
+  gap: 8px;
+}
+.worlds__row input {
+  flex: 1;
+}
+.worlds__pending {
+  color: #ffb020;
+}
+.worlds__error {
+  padding: 0 14px;
+  color: #e5484d;
+}
+.worlds__notice {
+  padding: 0 14px;
+  color: #3ecf6e;
+}
+.worlds__row select {
+  flex: none;
+  width: auto;
+}
+
+/* ---- audit ------------------------------------------------------------- */
+
+.worlds__tabs {
+  display: flex;
+  flex: none;
+  gap: 2px;
+  margin-left: 14px;
+}
+.audit__filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px 8px;
+}
+.audit__filters input[type='text'],
+.audit__filters input:not([type]) {
+  width: 160px;
+}
+.audit__date {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--fg-2, #8b93a1);
+  font-size: 11px;
+}
+.audit__types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  width: 100%;
+  font-size: 11px;
+}
+.audit__types label {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+.audit__scope {
+  padding: 0 14px 6px;
+}
+.audit__table td {
+  vertical-align: top;
+}
+.audit__when {
+  white-space: nowrap;
+  color: var(--fg-2, #8b93a1);
+}
+.audit__details {
+  max-width: 260px;
+  overflow-wrap: anywhere;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10.5px;
+}
+.audit__type {
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--bg-3, #2a2f38);
+  font-size: 10.5px;
+}
+.audit__type--chat,
+.audit__type--pm {
+  background: #1f3a5c;
+}
+.audit__type--death {
+  background: #5c1f26;
+}
+.audit__type--admin,
+.audit__type--command {
+  background: #5c4a1f;
+}
+.audit__ok {
+  color: #3ecf6e;
+}
+.audit__bad {
+  color: #e5484d;
+}
+.audit__more {
+  margin: 8px 14px;
+}
+.link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent, #4c9aff);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.audit__filters select {
+  flex: none;
+  width: auto;
+}
+
+/* ---- player page ------------------------------------------------------- */
+
+.player {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 14px 10px;
+}
+.player__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.player__name {
+  font-size: 15px;
+  font-weight: 600;
+}
+.player__facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 14px;
+  row-gap: 3px;
+  margin: 0;
+}
+.player__facts dt {
+  color: var(--fg-2, #8b93a1);
+}
+.player__facts dd {
+  margin: 0;
+}
+.player__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.player__actions .field__row {
+  gap: 8px;
+  align-items: center;
+}
+.player__actions select {
+  flex: none;
+  width: auto;
+}
+.player__label {
+  width: 70px;
+  color: var(--fg-2, #8b93a1);
+}
+.player__password {
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-size: 13px;
+  user-select: all;
+}
+.player__skills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 11px;
+}
+/* Walkability warnings: overlays players cannot stand on, shut doors. */
+.row__tag--warn {
+  color: #ffb020;
+  border-color: #5c4a1f;
+}
+.hint--warn {
+  color: #ffb020;
+}
+
+/* --- the Worlds screen's systemd logs (components/LogPanel.tsx) --------- */
+.logs {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: 6px;
+  padding: 8px 12px 12px;
+}
+.logs__pane {
+  overflow: auto;
+  flex: 1;
+  min-height: 220px;
+  padding: 6px 8px;
+  border: 1px solid var(--line, #2a2f3a);
+  border-radius: 4px;
+  background: var(--bg-0, #0a0c0f);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.logs__line {
+  display: flex;
+  gap: 8px;
+  /* A wrapped line stays readable; a truncated one hides the error. */
+  overflow-wrap: anywhere;
+}
+.logs__line--error {
+  color: var(--bad, #ff6b6b);
+}
+.logs__when {
+  white-space: nowrap;
+  color: var(--fg-2, #8b93a1);
+}
+.logs__unit {
+  white-space: nowrap;
+  color: var(--accent, #7cc5ff);
+}
+.logs__text {
+  flex: 1;
 }
